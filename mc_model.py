@@ -1,11 +1,11 @@
 """
-Professional Monte Carlo Model with parallel processing
+Professional Monte Carlo Model (fixed)
 Supports GARCH volatility, fat-tailed distributions, and mean reversion
 """
 
 import numpy as np
-from scipy.stats import t, norm
-from typing import Dict, List, Optional
+from scipy.stats import t
+from typing import Dict, List
 from utils import validate_inputs, calculate_stats
 from config import PERFORMANCE_CONFIG, MC_DEFAULTS, DISTRIBUTION_CONFIG, VALIDATION
 import logging
@@ -15,261 +15,221 @@ import time
 
 logger = logging.getLogger(__name__)
 
+# ============================================================
+# FIXED _simulate_path FUNCTION
+# ============================================================
+
 def _simulate_path(args: tuple) -> float:
     """
-    Helper function for simulation
+    Robust path simulator:
+      - mu, sigma inputs in percent; converted to decimal internally
+      - Mean reversion via Ornstein-Uhlenbeck
+      - Optional GARCH(1,1)
+      - Compounds geometrically using exp(r_t * dt)
     """
     (mu, sigma, horizon, mean_reversion, dist_type, tdf,
      enable_garch, garch_omega, garch_alpha, garch_beta, skew, seed_offset) = args
-    
-    # Set unique seed for this simulation
+
+    # Per-path RNG seed
     if seed_offset is not None:
-        np.random.seed(seed_offset)
-    
-    steps = max(1, int(horizon * MC_DEFAULTS['steps_per_year']))
-    dt = horizon / steps
-    wealth = 1.0  # Start with initial wealth of 1 for compound return calculation
-    
-    mu_dec = mu / 100.0  # Convert percentage to decimal
-    sigma_dec = sigma / 100.0  # Convert percentage to decimal
-    theta = mean_reversion  # Annual reversion speed
-    
-    current_r = mu  # Start with annualized return rate at mean (%)
-    
-    if enable_garch:
-        vol_dec = sigma_dec
-        for i in range(steps):
-            vol_dt_dec = vol_dec * np.sqrt(dt)
-            
-            # Generate shock
-            if dist_type == 't':
-                standardized_shock = t.rvs(df=tdf) / np.sqrt(tdf / (tdf - 2)) if tdf > 2 else np.random.normal(0, 1)
-            elif dist_type == 'skewt':
-                base = t.rvs(df=tdf) / np.sqrt(tdf / (tdf - 2)) if tdf > 2 else np.random.normal(0, 1)
-                standardized_shock = base * (1 + skew * np.random.randn())
-            else:
-                standardized_shock = np.random.normal(0, 1)
-            
-            shock_dec = standardized_shock * vol_dt_dec
-            
-            # Update annualized return rate with mean reversion
-            drift_dec = mu_dec * dt
-            reversion_dec = theta * dt * (mu_dec - current_r / 100.0)
-            current_r_dec = current_r / 100.0 + drift_dec + reversion_dec + shock_dec
-            current_r = current_r_dec * 100.0  # Back to %
-            
-            # Incremental return (properly scaled for time step)
-            inc_return_dec = current_r_dec * dt
-            
-            # Compound wealth with clipping to prevent numerical instability
-            wealth *= (1 + np.clip(inc_return_dec, -0.5, 0.5))
-            
-            # Update volatility (GARCH)
-            epsilon_squared = (shock_dec / np.sqrt(dt)) ** 2
-            vol_squared_dec = garch_omega + garch_alpha * epsilon_squared + garch_beta * (vol_dec ** 2)
-            vol_dec = np.sqrt(np.clip(vol_squared_dec, MC_DEFAULTS['min_vol'], MC_DEFAULTS['max_vol']))
-            
-            # Debug logging for extreme values
-            if i % 100 == 0 and (wealth > 1000 or wealth < 0.01):
-                logger.debug(f"Step {i}: wealth={wealth:.4f}, current_r={current_r:.2f}%, vol_dec={vol_dec*100:.2f}%")
-    
-    else:
-        for i in range(steps):
-            vol_dt_dec = sigma_dec * np.sqrt(dt)
-            
-            # Generate shock
-            if dist_type == 't':
-                shock_dec = t.rvs(df=tdf) * vol_dt_dec / np.sqrt(tdf / (tdf - 2)) if tdf > 2 else np.random.normal(0, vol_dt_dec)
-            elif dist_type == 'skewt':
-                base_shock = t.rvs(df=tdf) * vol_dt_dec / np.sqrt(tdf / (tdf - 2)) if tdf > 2 else np.random.normal(0, vol_dt_dec)
-                shock_dec = base_shock * (1 + skew * np.random.randn())
-            else:
-                shock_dec = np.random.normal(0, vol_dt_dec)
-            
-            # Update annualized return rate with mean reversion
-            drift_dec = mu_dec * dt
-            reversion_dec = theta * dt * (mu_dec - current_r / 100.0)
-            current_r_dec = current_r / 100.0 + drift_dec + reversion_dec + shock_dec
-            current_r = current_r_dec * 100.0  # Back to %
-            
-            # Incremental return (properly scaled for time step)
-            inc_return_dec = current_r_dec * dt
-            
-            # Compound wealth with clipping to prevent numerical instability
-            wealth *= (1 + np.clip(inc_return_dec, -0.5, 0.5))
-            
-            # Debug logging for extreme values
-            if i % 100 == 0 and (wealth > 1000 or wealth < 0.01):
-                logger.debug(f"Step {i}: wealth={wealth:.4f}, current_r={current_r:.2f}%, vol_dec={sigma_dec*100:.2f}%")
-    
-    # Return cumulative compound return as percentage
+        np.random.seed(int(seed_offset))
+
+    # Simulation setup
+    steps = max(1, int(horizon * MC_DEFAULTS.get("steps_per_year", 252)))
+    dt = float(horizon) / steps
+
+    mu_dec = float(mu) / 100.0
+    sigma_dec = float(sigma) / 100.0
+    theta = float(mean_reversion)
+    r_t = mu_dec  # current annualized return rate (decimal)
+    wealth = 1.0
+
+    # GARCH variance (annualized)
+    var_t = max(sigma_dec**2, MC_DEFAULTS.get("min_vol", 1e-6)**2)
+
+    def draw_standardized_t(df):
+        if df is None or df <= 2:
+            return np.random.normal(0.0, 1.0)
+        x = t.rvs(df=df)
+        return x / np.sqrt(df / (df - 2.0))
+
+    for i in range(steps):
+        # ----- Draw shock -----
+        if dist_type == "t":
+            eps = draw_standardized_t(tdf)
+        elif dist_type == "skewt":
+            eps = draw_standardized_t(tdf) * (1 + skew * np.random.normal(0.0, 0.5))
+        else:
+            eps = np.random.normal(0.0, 1.0)
+
+        vol_annual = np.sqrt(var_t)
+        vol_step = vol_annual * np.sqrt(dt)
+
+        # OU mean reversion on instantaneous annualized rate
+        dr = theta * (mu_dec - r_t) * dt + vol_annual * eps * np.sqrt(dt)
+        r_t = r_t + dr
+        r_t = np.clip(r_t, -1.0, 1.0)  # Prevent extreme drifts
+
+        # Compound wealth geometrically
+        inc_log = r_t * dt
+        inc_log = np.clip(inc_log, -0.5, 0.5)
+        wealth *= np.exp(inc_log)
+
+        # GARCH update
+        if enable_garch:
+            eps2 = (eps * vol_annual)**2  # Scale shock by current volatility
+            var_next = garch_omega + garch_alpha * eps2 + garch_beta * var_t
+            var_t = np.clip(
+                var_next,
+                MC_DEFAULTS.get("min_vol", 1e-6)**2,
+                MC_DEFAULTS.get("max_vol", 1.0)**2  # Tighter max variance
+            )
+
+        # Debug extreme values
+        if i % 100 == 0 and (wealth > 1000 or wealth < 0.01):
+            logger.debug(f"Step {i}: wealth={wealth:.4f}, r_t={r_t*100:.2f}%, vol_annual={vol_annual*100:.2f}%")
+
     final_return = (wealth - 1.0) * 100.0
-    if abs(final_return) > 10000:
-        logger.warning(f"Extreme return detected: {final_return:.2f}%")
-    return np.clip(final_return, -1000, 10000)  # Cap extreme returns
+    if not np.isfinite(final_return):
+        logger.warning(f"Non-finite return detected; setting to -1000%")
+        final_return = -1000.0
+    return float(np.clip(final_return, -1000.0, 10000.0))
+
+# ============================================================
+# MAIN CLASS
+# ============================================================
 
 class ProfessionalMCModel:
     """
-    Professional Monte Carlo Asset Return Simulator
-    
-    Features:
-    - Fat-tailed distributions (Student-t, Skewed-t)
-    - GARCH(1,1) volatility clustering
-    - Mean reversion dynamics
-    - Macro factor sensitivities
-    - Parallel processing support
-    
-    Examples:
-        >>> model = ProfessionalMCModel()
-        >>> inputs = {
-        ...     'baseMu': 10.0,
-        ...     'baseSigma': 15.0,
-        ...     'horizon': 1.0,
-        ...     'iters': 10000,
-        ...     'betas': {...}
-        ... }
-        >>> results = model.run(inputs)
-        >>> print(f"Mean return: {results['stats']['mean']:.2f}%")
-    
-    References:
-        - Bollerslev, T. (1986). "Generalized autoregressive conditional heteroskedasticity"
-        - McNeil, A. J., Frey, R., & Embrechts, P. (2015). "Quantitative Risk Management"
+    Professional Monte Carlo Asset Return Simulator (fixed)
     """
-    
-    def __init__(self):
-        self.use_multiprocessing = False  # Temporarily disable for debugging
-        self.n_processes = PERFORMANCE_CONFIG['n_processes'] or max(1, cpu_count() - 1)
-        logger.info(f"Model initialized (multiprocessing: {self.use_multiprocessing}, processes: {self.n_processes})")
 
+    def __init__(self):
+        self.use_multiprocessing = False  # Disabled for stability
+        self.n_processes = PERFORMANCE_CONFIG.get("n_processes") or max(1, cpu_count() - 1)
+        logger.info(f"Model initialized (multiprocessing={self.use_multiprocessing})")
+
+    # --------------------------------------------------------
+    # Run Simulation
+    # --------------------------------------------------------
     def run(self, inputs: Dict) -> Dict:
         """
         Run Monte Carlo simulation with progress bar
-        
-        Args:
-            inputs: Dictionary with all simulation parameters
-            
-        Returns:
-            Dictionary with stats, riskMetrics, percentiles, and results
         """
         try:
             logger.info("Starting Monte Carlo simulation")
-            
-            # Validate inputs
+
             is_valid, errors = validate_inputs(inputs)
             if not is_valid:
-                error_msgs = [e.message for e in errors if e.severity == 'error']
-                logger.error(f"Validation failed: {error_msgs}")
-                raise ValueError("Validation failed:\n" + "\n".join(error_msgs))
-            
-            logger.debug(f"Inputs: {inputs}")
-            
-            # Additional validation for distribution parameters
-            dist_type = inputs.get('distType', 'normal')
-            tdf = inputs.get('tdf', DISTRIBUTION_CONFIG[dist_type]['default_tdf'] if dist_type in ['t', 'skewt'] else 5.0)
-            if dist_type in ['t', 'skewt'] and (tdf < 2.1 or tdf > 30):
+                msgs = [e.message for e in errors if e.severity == "error"]
+                logger.error(f"Validation failed: {msgs}")
+                raise ValueError("Validation failed:\n" + "\n".join(msgs))
+
+            dist_type = inputs.get("distType", "normal")
+            tdf = inputs.get("tdf", DISTRIBUTION_CONFIG.get(dist_type, {}).get("default_tdf", 5.0))
+            if dist_type in ["t", "skewt"] and (tdf < 2.1 or tdf > 30):
                 logger.warning(f"Invalid tdf={tdf}, resetting to 5.0")
                 tdf = 5.0
-            
-            # Set random seed for reproducibility
-            seed = inputs.get('seed')
+
+            seed = inputs.get("seed")
             if seed is not None:
                 np.random.seed(int(seed))
-                logger.info(f"Using seed: {seed}")
-            
-            # Handle null values with defaults
+                logger.info(f"Using seed {seed}")
+
+            # Macro factor adjustments
+            mu = float(inputs["baseMu"])
+            sigma = float(inputs["baseSigma"])
+            horizon = float(inputs["horizon"])
+            iterations = int(inputs["iters"])
+            mean_reversion = float(inputs.get("meanReversion", 0.0))
+
+            betas = inputs.get("betas", {})
             macro_factors = {
-                'realRate': inputs.get('realRate', 0) or 0,
-                'expRealRate': inputs.get('expRealRate', 0) or 0,
-                'inflExp': inputs.get('inflExp', 0) or 0,
-                'vix': inputs.get('vix', 15.0) or 15.0,
-                'dxy': inputs.get('dxy', 100.0) or 100.0,
-                'creditSpread': inputs.get('creditSpread', 100.0) or 100.0,
-                'termSpread': inputs.get('termSpread', 0) or 0
+                "realRate": inputs.get("realRate", 0) or 0,
+                "expRealRate": inputs.get("expRealRate", 0) or 0,
+                "inflExp": inputs.get("inflExp", 0) or 0,
+                "vix": inputs.get("vix", 15.0) or 15.0,
+                "dxy": inputs.get("dxy", 100.0) or 100.0,
+                "creditSpread": inputs.get("creditSpread", 100.0) or 100.0,
+                "termSpread": inputs.get("termSpread", 0) or 0,
             }
 
-            # Adjust mean based on macro factors with horizon scaling
-            mu = inputs['baseMu']
-            betas = inputs.get('betas', {})
-            
-            beta_mapping = {
-                'realRate': 'real',
-                'expRealRate': 'expReal',
-                'inflExp': 'infl',
-                'vix': 'vix',
-                'dxy': 'dxy',
-                'creditSpread': 'credit',
-                'termSpread': 'term'
+            beta_map = {
+                "realRate": "real",
+                "expRealRate": "expReal",
+                "inflExp": "infl",
+                "vix": "vix",
+                "dxy": "dxy",
+                "creditSpread": "credit",
+                "termSpread": "term",
             }
-            
-            horizon = inputs['horizon']
-            macro_weight = np.exp(-horizon / 10.0)  # Exponential decay for long horizons
+
+            macro_weight = np.exp(-horizon / 10.0)
             mu += sum(
-                betas.get(beta_mapping.get(factor, factor), 0) * value * macro_weight
-                for factor, value in macro_factors.items()
-                if beta_mapping.get(factor, factor) in betas and value is not None
+                betas.get(beta_map.get(f, f), 0) * val * macro_weight
+                for f, val in macro_factors.items()
+                if beta_map.get(f, f) in betas
             )
 
-            # Adjust volatility with horizon scaling
-            sigma = inputs['baseSigma']
-            if 'vix' in betas:
-                vix_factor = (macro_factors['vix'] / 15.0 - 1)
-                sigma *= (1 + betas['vix'] * vix_factor * macro_weight)
-            sigma = np.clip(sigma, VALIDATION['min_sigma'], VALIDATION['max_sigma'])
+            if "vix" in betas:
+                vix_factor = (macro_factors["vix"] / 15.0 - 1)
+                sigma *= (1 + betas["vix"] * vix_factor * macro_weight)
+            sigma = np.clip(sigma, VALIDATION["min_sigma"], VALIDATION["max_sigma"])
 
-            # Simulation parameters
-            horizon = inputs['horizon']
-            iterations = int(inputs['iters'])
-            mean_reversion = inputs.get('meanReversion', 0)
-            dist_type = inputs.get('distType', 'normal')
-            tdf = inputs.get('tdf', DISTRIBUTION_CONFIG[dist_type]['default_tdf'] if dist_type in ['t', 'skewt'] else 5.0)
-            skew = inputs.get('skew', DISTRIBUTION_CONFIG[dist_type].get('default_skew', 0.2) if dist_type == 'skewt' else 0.0)
-            enable_garch = inputs.get('enableGarch', False)
-            
-            # Validate GARCH parameters
-            garch_omega = inputs.get('garchOmega', 0.0001) if enable_garch else 0
-            garch_alpha = inputs.get('garchAlpha', 0.08) if enable_garch else 0
-            garch_beta = inputs.get('garchBeta', 0.90) if enable_garch else 0
-            if enable_garch and (garch_alpha + garch_beta >= 1.0):
-                logger.warning(f"Unstable GARCH parameters (alpha+beta={garch_alpha+garch_beta}); disabling GARCH")
+            # GARCH parameters
+            enable_garch = bool(inputs.get("enableGarch", False))
+            garch_omega = inputs.get("garchOmega", 0.0001) if enable_garch else 0
+            garch_alpha = inputs.get("garchAlpha", 0.08) if enable_garch else 0
+            garch_beta = inputs.get("garchBeta", 0.90) if enable_garch else 0
+            if enable_garch and garch_alpha + garch_beta >= 1.0:
+                logger.warning("Unstable GARCH params; disabling GARCH")
                 enable_garch = False
                 garch_omega = garch_alpha = garch_beta = 0
-            
-            logger.info(f"Simulation parameters: mu={mu:.2f}%, sigma={sigma:.2f}%, horizon={horizon}, iterations={iterations}, dist_type={dist_type}, enable_garch={enable_garch}")
-            
-            # Initialize progress bar
+
+            skew = inputs.get(
+                "skew",
+                DISTRIBUTION_CONFIG.get(dist_type, {}).get("default_skew", 0.2)
+                if dist_type == "skewt"
+                else 0.0,
+            )
+
+            # Run simulation
             progress_bar = st.progress(0)
             st.text("Running Monte Carlo simulation...")
-            time.sleep(0.1)  # Brief pause to ensure UI updates
+            time.sleep(0.05)
 
-            # Run simulations (force sequential for debugging)
-            logger.info("Starting simulations")
-            returns = self._run_sequential(mu, sigma, horizon, mean_reversion, dist_type, tdf,
-                                         enable_garch, inputs, iterations, seed, progress_bar)
-            
-            logger.info("Simulations completed")
+            logger.info(
+                f"Params: mu={mu:.2f}%, sigma={sigma:.2f}%, horizon={horizon}, iters={iterations}, dist={dist_type}, GARCH={enable_garch}"
+            )
+
+            returns = self._run_sequential(
+                mu, sigma, horizon, mean_reversion, dist_type, tdf,
+                enable_garch, garch_omega, garch_alpha, garch_beta, skew,
+                iterations, seed, progress_bar
+            )
+
             progress_bar.progress(1.0)
-            
-            # Calculate statistics
-            logger.info("Calculating statistics")
             result = calculate_stats(returns)
-            logger.info(f"Simulation results: mean={result['stats']['mean']:.2f}%, std={result['stats']['stdDev']:.2f}%")
+            logger.info(f"Results: mean={result['stats']['mean']:.2f}%, std={result['stats']['stdDev']:.2f}%")
             return result
-        
+
         except Exception as e:
             logger.error(f"Simulation failed: {str(e)}")
             raise
 
-    def _run_sequential(self, mu, sigma, horizon, mean_reversion, dist_type, tdf,
-                       enable_garch, inputs, iterations, base_seed, progress_bar) -> List[float]:
-        """Run simulations sequentially with progress bar"""
+    # --------------------------------------------------------
+    # Sequential Simulation
+    # --------------------------------------------------------
+    def _run_sequential(
+        self, mu, sigma, horizon, mean_reversion, dist_type, tdf,
+        enable_garch, garch_omega, garch_alpha, garch_beta, skew,
+        iterations, base_seed, progress_bar
+    ) -> List[float]:
+        """
+        Run simulations sequentially with frequent progress updates
+        """
         logger.info(f"Running sequential simulation with {iterations} iterations")
-        
         returns = []
-        garch_omega = inputs.get('garchOmega', 0.0001) if enable_garch else 0
-        garch_alpha = inputs.get('garchAlpha', 0.08) if enable_garch else 0
-        garch_beta = inputs.get('garchBeta', 0.90) if enable_garch else 0
-        skew = inputs.get('skew', DISTRIBUTION_CONFIG[dist_type].get('default_skew', 0.2) if dist_type == 'skewt' else 0.0)
-        
         try:
             for i in range(iterations):
                 args = (
@@ -277,157 +237,144 @@ class ProfessionalMCModel:
                     enable_garch, garch_omega, garch_alpha, garch_beta, skew,
                     (base_seed + i) if base_seed is not None else None
                 )
-                returns.append(_simulate_path(args))
-                progress_bar.progress((i + 1) / iterations)
-                if i % 100 == 0:
-                    logger.debug(f"Iteration {i}/{iterations}")
+                ret = _simulate_path(args)
+                returns.append(ret)
+                if (i + 1) % max(10, iterations // 100) == 0:  # Update every ~1% or 10 iterations
+                    progress_bar.progress(min(1.0, (i + 1) / iterations))
+                    time.sleep(0.05)  # Allow UI refresh
+                    logger.debug(f"Iteration {i+1}/{iterations}, return={ret:.2f}%")
         except Exception as e:
-            logger.error(f"Sequential simulation failed at iteration {i}: {str(e)}")
+            logger.error(f"Sequential simulation failed at iteration {i+1}: {str(e)}")
             raise
-        
         return returns
 
-    def _run_parallel(self, mu, sigma, horizon, mean_reversion, dist_type, tdf,
-                     enable_garch, inputs, iterations, base_seed, progress_bar) -> List[float]:
-        """Run simulations in parallel using multiprocessing with progress bar"""
+    # --------------------------------------------------------
+    # Parallel Simulation
+    # --------------------------------------------------------
+    def _run_parallel(
+        self, mu, sigma, horizon, mean_reversion, dist_type, tdf,
+        enable_garch, garch_omega, garch_alpha, garch_beta, skew,
+        iterations, base_seed
+    ) -> List[float]:
+        """
+        Run simulations in parallel with basic progress tracking
+        """
         logger.info(f"Running parallel simulation with {self.n_processes} processes")
-        
-        garch_omega = inputs.get('garchOmega', 0.0001) if enable_garch else 0
-        garch_alpha = inputs.get('garchAlpha', 0.08) if enable_garch else 0
-        garch_beta = inputs.get('garchBeta', 0.90) if enable_garch else 0
-        skew = inputs.get('skew', DISTRIBUTION_CONFIG[dist_type].get('default_skew', 0.2) if dist_type == 'skewt' else 0.0)
-        
-        # Initialize shared counter for progress tracking
         manager = Manager()
         counter = manager.Value('i', 0)
-        
+
         args_list = [
             (
                 mu, sigma, horizon, mean_reversion, dist_type, tdf,
                 enable_garch, garch_omega, garch_alpha, garch_beta, skew,
-                (base_seed + i) if base_seed is not None else None,
-                counter, iterations
+                (base_seed + i) if base_seed is not None else None
             )
             for i in range(iterations)
         ]
-        
         try:
             with Pool(processes=self.n_processes) as pool:
                 returns = pool.map(_simulate_path, args_list)
+            logger.info("Parallel simulation completed")
+            return returns
         except Exception as e:
             logger.error(f"Parallel simulation failed: {str(e)}")
             raise
-        
-        return returns
 
+    # --------------------------------------------------------
+    # Backtest
+    # --------------------------------------------------------
     def backtest(self, inputs: Dict) -> Dict:
         """
         Walk-forward backtest on historical data
-        
-        Uses each historical period to predict the next period
         """
-        historical_data = inputs.get('historical_data', [])
-        
-        if not historical_data or len(historical_data) < 2:
-            raise ValueError("Backtesting requires at least 2 historical returns")
-        
-        logger.info(f"Starting backtest with {len(historical_data)} historical periods")
-        
-        predictions = []
-        horizon = inputs['horizon']
-        iterations = inputs.get('iters', 1000)
-        
         try:
-            for i in range(len(historical_data) - 1):
-                temp_inputs = inputs.copy()
-                temp_inputs['iters'] = iterations
-                
-                if i > 0:
-                    hist_vol = np.std(historical_data[:i+1])
-                    temp_inputs['baseSigma'] = max(VALIDATION['min_sigma'], hist_vol)
-                
-                result = self.run(temp_inputs)
-                predictions.append(result['stats']['mean'])
-                logger.debug(f"Backtest period {i+1}: predicted {result['stats']['mean']:.2f}%")
-        except Exception as e:
-            logger.error(f"Backtest period {i+1} failed: {str(e)}")
-            raise
-        
-        actuals = historical_data[1:]
-        errors = np.array(predictions) - np.array(actuals)
-        
-        mae = np.mean(np.abs(errors))
-        rmse = np.sqrt(np.mean(errors ** 2))
-        ss_res = np.sum(errors ** 2)
-        ss_tot = np.sum((actuals - np.mean(actuals)) ** 2)
-        r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
-        hit_rate = np.mean(np.sign(predictions) == np.sign(actuals))
-        
-        logger.info(f"Backtest complete: R²={r2:.3f}, MAE={mae:.2f}%, Hit Rate={hit_rate*100:.1f}%")
-        
-        return {
-            'years': list(range(1, len(actuals) + 1)),
-            'actuals': actuals,
-            'predictions': predictions,
-            'stats': {
-                'mae': float(mae),
-                'rmse': float(rmse),
-                'r2': float(r2),
-                'hitRate': float(hit_rate)
-            }
-        }
+            historical = inputs.get("historical_data", [])
+            if not historical or len(historical) < 2:
+                raise ValueError("Backtest requires ≥2 historical returns")
 
+            logger.info(f"Starting backtest with {len(historical)} periods")
+            predictions = []
+            horizon = inputs["horizon"]
+            iters = inputs.get("iters", 1000)
+
+            for i in range(len(historical) - 1):
+                temp_inputs = inputs.copy()
+                temp_inputs["iters"] = iters
+                if i > 0:
+                    hist_vol = np.std(historical[:i + 1])
+                    temp_inputs["baseSigma"] = max(VALIDATION["min_sigma"], hist_vol)
+                result = self.run(temp_inputs)
+                predictions.append(result["stats"]["mean"])
+                logger.debug(f"Backtest period {i+1}: predicted {result['stats']['mean']:.2f}%")
+
+            actuals = historical[1:]
+            errors = np.array(predictions) - np.array(actuals)
+            mae = np.mean(np.abs(errors))
+            rmse = np.sqrt(np.mean(errors ** 2))
+            ss_res = np.sum(errors ** 2)
+            ss_tot = np.sum((actuals - np.mean(actuals)) ** 2)
+            r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0
+            hit = np.mean(np.sign(predictions) == np.sign(actuals))
+
+            logger.info(f"Backtest complete: R²={r2:.3f}, MAE={mae:.2f}%, Hit Rate={hit*100:.1f}%")
+            return {
+                "years": list(range(1, len(actuals) + 1)),
+                "actuals": actuals,
+                "predictions": predictions,
+                "stats": {
+                    "mae": float(mae),
+                    "rmse": float(rmse),
+                    "r2": float(r2),
+                    "hitRate": float(hit),
+                },
+            }
+        except Exception as e:
+            logger.error(f"Backtest failed: {str(e)}")
+            raise
+
+    # --------------------------------------------------------
+    # Sensitivity Analysis
+    # --------------------------------------------------------
     def run_sensitivity_analysis(self, inputs: Dict) -> Dict:
         """
         Analyze sensitivity of returns to macro factors
         """
-        logger.info("Starting sensitivity analysis")
-        
-        factors = ['vix', 'inflExp', 'realRate', 'creditSpread']
-        
-        ranges = {
-            'vix': np.linspace(5, 50, 10),
-            'inflExp': np.linspace(0, 5, 10),
-            'realRate': np.linspace(-2, 5, 10),
-            'creditSpread': np.linspace(0, 300, 10)
-        }
-        
-        results = {
-            'factor': [],
-            'value': [],
-            'mean_return': []
-        }
-        
         try:
+            logger.info("Running sensitivity analysis")
+            factors = ["vix", "inflExp", "realRate", "creditSpread"]
+            ranges = {
+                "vix": np.linspace(5, 50, 10),
+                "inflExp": np.linspace(0, 5, 10),
+                "realRate": np.linspace(-2, 5, 10),
+                "creditSpread": np.linspace(0, 300, 10),
+            }
+
+            results = {"factor": [], "value": [], "mean_return": []}
             for factor in factors:
                 if factor not in ranges:
                     continue
-                
                 logger.debug(f"Analyzing sensitivity to {factor}")
                 base_inputs = inputs.copy()
-                base_inputs['iters'] = 1000
-                
+                base_inputs["iters"] = 500
                 for value in ranges[factor]:
                     test_inputs = base_inputs.copy()
                     test_inputs[factor] = float(value)
-                    
-                    result = self.run(test_inputs)
-                    mean_return = result['stats']['mean']
-                    
-                    results['factor'].append(factor)
-                    results['value'].append(float(value))
-                    results['mean_return'].append(float(mean_return))
+                    out = self.run(test_inputs)
+                    results["factor"].append(factor)
+                    results["value"].append(float(value))
+                    results["mean_return"].append(float(out["stats"]["mean"]))
+            logger.info("Sensitivity analysis complete")
+            return results
         except Exception as e:
             logger.error(f"Sensitivity analysis failed: {str(e)}")
             raise
-        
-        logger.info("Sensitivity analysis complete")
-        return results
 
+    # --------------------------------------------------------
+    # Placeholder for Live Macros
+    # --------------------------------------------------------
     def fetch_live_macros(self):
         """
         Placeholder for fetching live macro data
-        Currently returns empty dict as per user requirement
         """
-        logger.info("Live macro data fetching disabled")
+        logger.info("Live macro fetch disabled")
         return {}
