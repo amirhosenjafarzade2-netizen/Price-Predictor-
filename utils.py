@@ -165,7 +165,7 @@ def create_histogram_plot(
     # Add percentile lines
     for p, label, color in [
         (percentiles['p50'], 'Median', 'green'),
-        (percentiles['p25'], '25th', 'blue'),  # Added for consistency with previous implementation
+        (percentiles['p25'], '25th', 'blue'),
         (percentiles['p75'], '75th', 'blue'),
         (percentiles['p05'], '5th', 'red'),
         (percentiles['p95'], '95th', 'orange')
