@@ -1,88 +1,116 @@
+"""
+Professional Monte Carlo Model with parallel processing
+Supports GARCH volatility, fat-tailed distributions, and mean reversion
+"""
+
 import numpy as np
 from scipy.stats import t, norm
-from typing import Dict, List
+from typing import Dict, List, Optional
 from utils import validate_inputs, calculate_stats
+from config import PERFORMANCE_CONFIG, MC_DEFAULTS
+import logging
+from multiprocessing import Pool, cpu_count
+import os
+
+logger = logging.getLogger(__name__)
+
+
+def _simulate_path(args: tuple) -> float:
+    """
+    Helper function for parallel simulation
+    Must be at module level for multiprocessing
+    """
+    (mu, sigma, horizon, mean_reversion, dist_type, tdf,
+     enable_garch, garch_omega, garch_alpha, garch_beta, seed_offset) = args
+    
+    # Set unique seed for this simulation
+    if seed_offset is not None:
+        np.random.seed(seed_offset)
+    
+    steps = max(1, int(horizon * MC_DEFAULTS['steps_per_year']))
+    returns = [0.0]
+    dt = horizon / steps
+    
+    if enable_garch:
+        vol = sigma
+        mu_dt = mu * dt
+        
+        for _ in range(steps):
+            vol_dt = vol * np.sqrt(dt)
+            
+            # Generate shock
+            if dist_type == 't':
+                standardized_shock = t.rvs(df=tdf) / np.sqrt(tdf / (tdf - 2))
+            elif dist_type == 'skewt':
+                base = t.rvs(df=tdf) / np.sqrt(tdf / (tdf - 2))
+                standardized_shock = base * (1 + 0.2 * np.random.randn())
+            else:
+                standardized_shock = np.random.normal(0, 1)
+            
+            shock = standardized_shock * vol_dt
+            
+            # Mean reversion
+            current_return = returns[-1]
+            new_return = (1 - mean_reversion) * current_return + mean_reversion * mu_dt + shock
+            returns.append(new_return)
+            
+            # Update volatility (GARCH)
+            epsilon_squared = (shock / np.sqrt(dt)) ** 2
+            vol_squared = garch_omega + garch_alpha * epsilon_squared + garch_beta * (vol ** 2)
+            vol = np.sqrt(np.clip(vol_squared, MC_DEFAULTS['min_vol'], MC_DEFAULTS['max_vol']))
+    else:
+        mu_dt = mu * dt
+        sigma_dt = sigma * np.sqrt(dt)
+        
+        for _ in range(steps):
+            if dist_type == 't':
+                shock = t.rvs(df=tdf) * sigma_dt / np.sqrt(tdf / (tdf - 2))
+            elif dist_type == 'skewt':
+                base_shock = t.rvs(df=tdf) * sigma_dt / np.sqrt(tdf / (tdf - 2))
+                shock = base_shock * (1 + 0.2 * np.random.randn())
+            else:
+                shock = np.random.normal(0, sigma_dt)
+            
+            current_return = returns[-1]
+            new_return = (1 - mean_reversion) * current_return + mean_reversion * mu_dt + shock
+            returns.append(new_return)
+    
+    # Return cumulative return as percentage
+    return sum(returns) * 100
 
 
 class ProfessionalMCModel:
+    """
+    Professional Monte Carlo Asset Return Simulator
+    
+    Features:
+    - Fat-tailed distributions (Student-t, Skewed-t)
+    - GARCH(1,1) volatility clustering
+    - Mean reversion dynamics
+    - Macro factor sensitivities
+    - Parallel processing support
+    
+    Examples:
+        >>> model = ProfessionalMCModel()
+        >>> inputs = {
+        ...     'baseMu': 10.0,
+        ...     'baseSigma': 15.0,
+        ...     'horizon': 1.0,
+        ...     'iters': 10000,
+        ...     'betas': {...}
+        ... }
+        >>> results = model.run(inputs)
+        >>> print(f"Mean return: {results['stats']['mean']:.2f}%")
+    
+    References:
+        - Bollerslev, T. (1986). "Generalized autoregressive conditional heteroskedasticity"
+        - McNeil, A. J., Frey, R., & Embrechts, P. (2015). "Quantitative Risk Management"
+    """
+    
     def __init__(self):
-        self.asset_presets = {
-            'equity': {
-                'name': 'S&P 500',
-                'mean': 9.2,
-                'sigma': 16.5,
-                'betas': {
-                    'real': -0.35,
-                    'expReal': -0.22,
-                    'infl': 0.15,
-                    'vix': 0.25,
-                    'dxy': -0.02,
-                    'credit': -0.08,
-                    'term': 0.05
-                },
-                'meanReversion': 0.15
-            },
-            'bonds': {
-                'name': '10Y Treasury',
-                'mean': 4.5,
-                'sigma': 7.8,
-                'betas': {
-                    'real': -0.85,
-                    'expReal': -0.65,
-                    'infl': -0.25,
-                    'vix': 0.12,
-                    'dxy': 0.03,
-                    'credit': -0.15,
-                    'term': 0.20
-                },
-                'meanReversion': 0.25
-            },
-            'reits': {
-                'name': 'REITs',
-                'mean': 8.5,
-                'sigma': 20.2,
-                'betas': {
-                    'real': -0.45,
-                    'expReal': -0.30,
-                    'infl': 0.20,
-                    'vix': 0.30,
-                    'dxy': -0.03,
-                    'credit': -0.12,
-                    'term': 0.08
-                },
-                'meanReversion': 0.20
-            },
-            'commodities': {
-                'name': 'Commodities',
-                'mean': 6.8,
-                'sigma': 22.5,
-                'betas': {
-                    'real': -0.20,
-                    'expReal': -0.15,
-                    'infl': 0.35,
-                    'vix': 0.28,
-                    'dxy': -0.05,
-                    'credit': -0.05,
-                    'term': 0.03
-                },
-                'meanReversion': 0.10
-            },
-            'custom': {
-                'name': 'Custom Asset',
-                'mean': 8.0,
-                'sigma': 15.0,
-                'betas': {
-                    'real': -0.30,
-                    'expReal': -0.20,
-                    'infl': 0.10,
-                    'vix': 0.20,
-                    'dxy': -0.01,
-                    'credit': -0.06,
-                    'term': 0.04
-                },
-                'meanReversion': 0.15
-            }
-        }
+        self.use_multiprocessing = PERFORMANCE_CONFIG['enable_multiprocessing']
+        self.n_processes = PERFORMANCE_CONFIG['n_processes'] or max(1, cpu_count() - 1)
+        logger.info(f"Model initialized (multiprocessing: {self.use_multiprocessing}, processes: {self.n_processes})")
 
     def run(self, inputs: Dict) -> Dict:
         """
@@ -97,12 +125,14 @@ class ProfessionalMCModel:
         # Validate inputs
         is_valid, errors = validate_inputs(inputs)
         if not is_valid:
-            raise ValueError("\n".join(errors))
+            error_msgs = [e.message for e in errors if e.severity == 'error']
+            raise ValueError("Validation failed:\n" + "\n".join(error_msgs))
         
         # Set random seed for reproducibility
         seed = inputs.get('seed')
         if seed is not None:
             np.random.seed(int(seed))
+            logger.info(f"Using seed: {seed}")
         
         # Handle null values with defaults
         macro_factors = {
@@ -138,142 +168,88 @@ class ProfessionalMCModel:
         sigma = inputs['baseSigma']
         if 'vix' in betas and macro_factors['vix'] > 0:
             vix_adjustment = 1 + betas['vix'] * (macro_factors['vix'] / 15.0 - 1)
-            sigma *= max(0.1, vix_adjustment)  # Prevent negative/zero volatility
+            sigma *= max(0.1, vix_adjustment)
 
-        # Generate simulations
-        returns = []
+        # Prepare simulation parameters
         horizon = inputs['horizon']
         iterations = int(inputs['iters'])
+        mean_reversion = inputs.get('meanReversion', 0)
+        dist_type = inputs.get('distType', 'normal')
+        tdf = inputs.get('tdf', 5)
+        enable_garch = inputs.get('enableGarch', False)
         
-        for i in range(iterations):
-            if inputs.get('enableGarch', False):
-                sim_returns = self._simulate_garch(
-                    mu / 100,
-                    sigma / 100,
-                    horizon,
-                    inputs.get('garchOmega', 0.0001),
-                    inputs.get('garchAlpha', 0.08),
-                    inputs.get('garchBeta', 0.90),
-                    inputs.get('meanReversion', 0),
-                    inputs.get('distType', 'normal'),
-                    inputs.get('tdf', 5)
-                )
-            else:
-                sim_returns = self._simulate_simple(
-                    mu / 100,
-                    sigma / 100,
-                    horizon,
-                    inputs.get('meanReversion', 0),
-                    inputs.get('distType', 'normal'),
-                    inputs.get('tdf', 5)
-                )
-            
-            # Convert final return back to percentage
-            returns.append(sim_returns[-1] * 100)
+        logger.info(
+            f"Starting simulation: {iterations} iterations, "
+            f"horizon={horizon:.2f}y, μ={mu:.2f}%, σ={sigma:.2f}%"
+        )
+
+        # Run simulations (parallel or sequential)
+        if self.use_multiprocessing and iterations >= 1000:
+            returns = self._run_parallel(
+                mu / 100, sigma / 100, horizon, mean_reversion,
+                dist_type, tdf, enable_garch, inputs, iterations, seed
+            )
+        else:
+            returns = self._run_sequential(
+                mu / 100, sigma / 100, horizon, mean_reversion,
+                dist_type, tdf, enable_garch, inputs, iterations
+            )
+
+        logger.info(f"Simulation complete: mean={np.mean(returns):.2f}%, std={np.std(returns):.2f}%")
 
         # Calculate and return statistics
         return calculate_stats(returns)
 
-    def _simulate_simple(
-        self,
-        mu: float,
-        sigma: float,
-        horizon: float,
-        mean_reversion: float,
-        dist_type: str,
-        tdf: float
+    def _run_sequential(
+        self, mu, sigma, horizon, mean_reversion, dist_type, tdf,
+        enable_garch, inputs, iterations
     ) -> List[float]:
-        """
-        Simple Monte Carlo path without GARCH
+        """Run simulations sequentially (for small iteration counts)"""
+        returns = []
         
-        Returns cumulative return path
-        """
-        steps = max(1, int(horizon * 252))  # Daily steps
-        returns = [0.0]  # Start at zero return
+        garch_params = (
+            inputs.get('garchOmega', 0.0001),
+            inputs.get('garchAlpha', 0.08),
+            inputs.get('garchBeta', 0.90)
+        ) if enable_garch else (0, 0, 0)
         
-        # Adjust parameters for time scaling
-        dt = horizon / steps
-        mu_dt = mu * dt
-        sigma_dt = sigma * np.sqrt(dt)
+        for i in range(iterations):
+            args = (
+                mu, sigma, horizon, mean_reversion, dist_type, tdf,
+                enable_garch, *garch_params, i
+            )
+            returns.append(_simulate_path(args))
         
-        for _ in range(steps):
-            # Generate random shock based on distribution type
-            if dist_type == 't':
-                # Standardized t-distribution
-                shock = t.rvs(df=tdf) * sigma_dt / np.sqrt(tdf / (tdf - 2))
-            elif dist_type == 'skewt':
-                # Skewed t-distribution (simple approximation)
-                base_shock = t.rvs(df=tdf) * sigma_dt / np.sqrt(tdf / (tdf - 2))
-                skew_factor = 1 + 0.2 * np.random.randn()
-                shock = base_shock * skew_factor
-            else:
-                # Normal distribution
-                shock = np.random.normal(0, sigma_dt)
-            
-            # Mean reversion: pull towards long-term mean
-            current_return = returns[-1]
-            new_return = (1 - mean_reversion) * current_return + mean_reversion * mu_dt + shock
-            returns.append(new_return)
-        
-        # Return cumulative returns
-        cumulative = [sum(returns[:i+1]) for i in range(len(returns))]
-        return cumulative
+        return returns
 
-    def _simulate_garch(
-        self,
-        mu: float,
-        sigma: float,
-        horizon: float,
-        omega: float,
-        alpha: float,
-        beta: float,
-        mean_reversion: float,
-        dist_type: str,
-        tdf: float
+    def _run_parallel(
+        self, mu, sigma, horizon, mean_reversion, dist_type, tdf,
+        enable_garch, inputs, iterations, base_seed
     ) -> List[float]:
-        """
-        GARCH(1,1) volatility clustering simulation
+        """Run simulations in parallel using multiprocessing"""
+        logger.info(f"Running parallel simulation with {self.n_processes} processes")
         
-        GARCH model: σ²(t) = ω + α*ε²(t-1) + β*σ²(t-1)
-        """
-        steps = max(1, int(horizon * 252))
-        returns = [0.0]
+        garch_params = (
+            inputs.get('garchOmega', 0.0001),
+            inputs.get('garchAlpha', 0.08),
+            inputs.get('garchBeta', 0.90)
+        ) if enable_garch else (0, 0, 0)
         
-        # Initialize volatility
-        vol = sigma
-        dt = horizon / steps
-        mu_dt = mu * dt
+        # Create argument list for each simulation
+        args_list = [
+            (
+                mu, sigma, horizon, mean_reversion, dist_type, tdf,
+                enable_garch, *garch_params,
+                (base_seed + i) if base_seed is not None else None
+            )
+            for i in range(iterations)
+        ]
         
-        for _ in range(steps):
-            # Time-scaled volatility
-            vol_dt = vol * np.sqrt(dt)
-            
-            # Generate standardized shock
-            if dist_type == 't':
-                standardized_shock = t.rvs(df=tdf) / np.sqrt(tdf / (tdf - 2))
-            elif dist_type == 'skewt':
-                base = t.rvs(df=tdf) / np.sqrt(tdf / (tdf - 2))
-                standardized_shock = base * (1 + 0.2 * np.random.randn())
-            else:
-                standardized_shock = np.random.normal(0, 1)
-            
-            # Scale by current volatility
-            shock = standardized_shock * vol_dt
-            
-            # Mean reversion
-            current_return = returns[-1]
-            new_return = (1 - mean_reversion) * current_return + mean_reversion * mu_dt + shock
-            returns.append(new_return)
-            
-            # Update volatility using GARCH(1,1)
-            # Vol is in annualized terms, shock is already time-scaled
-            epsilon_squared = (shock / np.sqrt(dt)) ** 2
-            vol_squared = omega + alpha * epsilon_squared + beta * (vol ** 2)
-            vol = np.sqrt(max(0.0001, vol_squared))  # Prevent negative variance
+        # Run in parallel
+        with Pool(processes=self.n_processes) as pool:
+            returns = pool.map(_simulate_path, args_list)
         
-        # Return cumulative returns
-        cumulative = [sum(returns[:i+1]) for i in range(len(returns))]
-        return cumulative
+        return returns
 
     def backtest(self, inputs: Dict) -> Dict:
         """
@@ -286,6 +262,8 @@ class ProfessionalMCModel:
         if not historical_data or len(historical_data) < 2:
             raise ValueError("Backtesting requires at least 2 historical returns")
         
+        logger.info(f"Starting backtest with {len(historical_data)} historical periods")
+        
         predictions = []
         
         # Walk-forward: use data up to period i to predict period i+1
@@ -294,7 +272,7 @@ class ProfessionalMCModel:
             temp_inputs = inputs.copy()
             temp_inputs['iters'] = 1000  # Reduce iterations for speed
             
-            # Use historical volatility if available
+            # Use historical volatility if we have enough data
             if i > 0:
                 hist_vol = np.std(historical_data[:i+1])
                 temp_inputs['baseSigma'] = max(1.0, hist_vol)
@@ -303,15 +281,17 @@ class ProfessionalMCModel:
             try:
                 result = self.run(temp_inputs)
                 predictions.append(result['stats']['mean'])
+                logger.debug(f"Backtest period {i+1}: predicted {result['stats']['mean']:.2f}%")
             except Exception as e:
-                # If simulation fails, use previous prediction or baseline
+                logger.warning(f"Backtest period {i+1} failed: {e}")
+                # Use previous prediction or baseline
                 if predictions:
                     predictions.append(predictions[-1])
                 else:
                     predictions.append(inputs.get('baseMu', 0))
         
-        # Align predictions with actuals (predictions are for next period)
-        actuals = historical_data[1:]  # Skip first period (no prediction for it)
+        # Align predictions with actuals
+        actuals = historical_data[1:]
         errors = np.array(predictions) - np.array(actuals)
         
         # Calculate metrics
@@ -325,6 +305,8 @@ class ProfessionalMCModel:
         
         # Hit rate: correct direction prediction
         hit_rate = np.mean(np.sign(predictions) == np.sign(actuals))
+        
+        logger.info(f"Backtest complete: R²={r2:.3f}, MAE={mae:.2f}%, Hit Rate={hit_rate*100:.1f}%")
         
         return {
             'years': list(range(1, len(actuals) + 1)),
@@ -342,6 +324,8 @@ class ProfessionalMCModel:
         """
         Analyze sensitivity of returns to macro factors
         """
+        logger.info("Starting sensitivity analysis")
+        
         factors = ['vix', 'inflExp', 'realRate', 'creditSpread']
         
         ranges = {
@@ -361,6 +345,7 @@ class ProfessionalMCModel:
             if factor not in ranges:
                 continue
             
+            logger.debug(f"Analyzing sensitivity to {factor}")
             base_inputs = inputs.copy()
             base_inputs['iters'] = 1000  # Reduce iterations for speed
             
@@ -371,11 +356,13 @@ class ProfessionalMCModel:
                 try:
                     sim_result = self.run(test_inputs)
                     mean_return = sim_result['stats']['mean']
-                except Exception:
+                except Exception as e:
+                    logger.warning(f"Sensitivity test failed for {factor}={value}: {e}")
                     mean_return = 0.0
                 
                 results['factor'].append(factor)
                 results['value'].append(float(value))
                 results['mean_return'].append(float(mean_return))
         
+        logger.info("Sensitivity analysis complete")
         return results
