@@ -2,6 +2,7 @@ import numpy as np
 import random
 from typing import Dict, List, Tuple
 from dataclasses import dataclass
+import streamlit as st
 
 @dataclass
 class Individual:
@@ -50,9 +51,13 @@ class GeneticOptimizer:
             'mean_reversion': (0, 0.5)
         }
         
+    @st.cache_data
     def optimize(self, base_inputs: Dict, generations: int = 50, population_size: int = 100,
                  elite_ratio: float = 0.2, mutation_rate: float = 0.15, mutation_strength: float = 0.1,
                  validation_split: float = 0.3) -> GAResult:
+        if len(self.historical_data) < 2:
+            raise ValueError("Genetic Algorithm requires at least 2 historical returns")
+        
         split_idx = int(len(self.historical_data) * (1 - validation_split))
         train_data = self.historical_data[:split_idx]
         valid_data = self.historical_data[split_idx:]
@@ -138,7 +143,8 @@ class GeneticOptimizer:
             regularization = self._calculate_regularization(individual)
             
             return -0.4 * mean_error - 0.3 * std_error + 0.2 * sharpe_score - 0.1 * regularization
-        except:
+        except Exception as e:
+            st.error(f"Fitness evaluation failed: {str(e)}")
             return -1000.0
 
     def _calculate_regularization(self, individual: Individual) -> float:
@@ -149,6 +155,8 @@ class GeneticOptimizer:
             center = (max_val + min_val) / 2
             deviation = abs(value - center) / (range_val / 2)
             penalty += deviation
+            if deviation > 0.9:
+                st.warning(f"Parameter {param_name} is near boundary: {value:.3f}")
         return penalty / len(individual.__dict__)
 
     def _calculate_diversity(self, population: List[Individual]) -> float:
