@@ -7,7 +7,7 @@ import numpy as np
 from scipy.stats import t, norm
 from typing import Dict, List, Optional
 from utils import validate_inputs, calculate_stats
-from config import PERFORMANCE_CONFIG, MC_DEFAULTS, DISTRIBUTION_CONFIG
+from config import PERFORMANCE_CONFIG, MC_DEFAULTS, DISTRIBUTION_CONFIG, VALIDATION
 import logging
 from multiprocessing import Pool, cpu_count
 import os
