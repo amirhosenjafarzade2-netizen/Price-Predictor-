@@ -10,7 +10,7 @@ from utils import validate_inputs, calculate_stats
 from config import PERFORMANCE_CONFIG, MC_DEFAULTS, DISTRIBUTION_CONFIG, VALIDATION
 import logging
 from multiprocessing import Pool, cpu_count
-import os
+import streamlit as st
 
 logger = logging.getLogger(__name__)
 
@@ -97,15 +97,113 @@ def _simulate_path(args: tuple) -> float:
     return (wealth - 1.0) * 100.0
 
 class ProfessionalMCModel:
-    # ... (rest of class unchanged)
+    """
+    Professional Monte Carlo Asset Return Simulator
+    
+    Features:
+    - Fat-tailed distributions (Student-t, Skewed-t)
+    - GARCH(1,1) volatility clustering
+    - Mean reversion dynamics
+    - Macro factor sensitivities
+    - Parallel processing support
+    
+    Examples:
+        >>> model = ProfessionalMCModel()
+        >>> inputs = {
+        ...     'baseMu': 10.0,
+        ...     'baseSigma': 15.0,
+        ...     'horizon': 1.0,
+        ...     'iters': 10000,
+        ...     'betas': {...}
+        ... }
+        >>> results = model.run(inputs)
+        >>> print(f"Mean return: {results['stats']['mean']:.2f}%")
+    
+    References:
+        - Bollerslev, T. (1986). "Generalized autoregressive conditional heteroskedasticity"
+        - McNeil, A. J., Frey, R., & Embrechts, P. (2015). "Quantitative Risk Management"
+    """
+    
+    def __init__(self):
+        self.use_multiprocessing = PERFORMANCE_CONFIG['enable_multiprocessing']
+        self.n_processes = PERFORMANCE_CONFIG['n_processes'] or max(1, cpu_count() - 1)
+        logger.info(f"Model initialized (multiprocessing: {self.use_multiprocessing}, processes: {self.n_processes})")
 
     def run(self, inputs: Dict) -> Dict:
-        # ... (validation and param setup unchanged)
+        """
+        Run Monte Carlo simulation
+        
+        Args:
+            inputs: Dictionary with all simulation parameters
+            
+        Returns:
+            Dictionary with stats, riskMetrics, percentiles, and results
+        """
+        # Validate inputs
+        is_valid, errors = validate_inputs(inputs)
+        if not is_valid:
+            error_msgs = [e.message for e in errors if e.severity == 'error']
+            raise ValueError("Validation failed:\n" + "\n".join(error_msgs))
+        
+        # Set random seed for reproducibility
+        seed = inputs.get('seed')
+        if seed is not None:
+            np.random.seed(int(seed))
+            logger.info(f"Using seed: {seed}")
+        
+        # Handle null values with defaults
+        macro_factors = {
+            'realRate': inputs.get('realRate', 0) or 0,
+            'expRealRate': inputs.get('expRealRate', 0) or 0,
+            'inflExp': inputs.get('inflExp', 0) or 0,
+            'vix': inputs.get('vix', 15.0) or 15.0,
+            'dxy': inputs.get('dxy', 100.0) or 100.0,
+            'creditSpread': inputs.get('creditSpread', 100.0) or 100.0,
+            'termSpread': inputs.get('termSpread', 0) or 0
+        }
 
+        # Adjust mean based on macro factors with horizon scaling
+        mu = inputs['baseMu']
+        betas = inputs.get('betas', {})
+        
+        beta_mapping = {
+            'realRate': 'real',
+            'expRealRate': 'expReal',
+            'inflExp': 'infl',
+            'vix': 'vix',
+            'dxy': 'dxy',
+            'creditSpread': 'credit',
+            'termSpread': 'term'
+        }
+        
+        horizon = inputs['horizon']
+        macro_weight = np.exp(-horizon / 10.0)  # Exponential decay for long horizons
+        mu += sum(
+            betas.get(beta_mapping.get(factor, factor), 0) * value * macro_weight
+            for factor, value in macro_factors.items()
+            if beta_mapping.get(factor, factor) in betas and value is not None
+        )
+
+        # Adjust volatility with horizon scaling
+        sigma = inputs['baseSigma']
+        if 'vix' in betas:
+            vix_factor = (macro_factors['vix'] / 15.0 - 1)
+            sigma *= (1 + betas['vix'] * vix_factor * macro_weight)
+        sigma = np.clip(sigma, VALIDATION['min_sigma'], VALIDATION['max_sigma'])
+
+        # Simulation parameters
+        horizon = inputs['horizon']
+        iterations = int(inputs['iters'])
+        mean_reversion = inputs.get('meanReversion', 0)
+        dist_type = inputs.get('distType', 'normal')
+        tdf = inputs.get('tdf', DISTRIBUTION_CONFIG[dist_type]['default_tdf'] if dist_type in ['t', 'skewt'] else 5.0)
+        skew = inputs.get('skew', DISTRIBUTION_CONFIG[dist_type].get('default_skew', 0.2) if dist_type == 'skewt' else 0.0)
+        enable_garch = inputs.get('enableGarch', False)
+        
         # Run simulations
         if self.use_multiprocessing and iterations >= PERFORMANCE_CONFIG['batch_size']:
             returns = self._run_parallel(mu, sigma, horizon, mean_reversion, dist_type, tdf,
-                                        enable_garch, inputs, iterations, seed)
+                                      enable_garch, inputs, iterations, seed)
         else:
             returns = self._run_sequential(mu, sigma, horizon, mean_reversion, dist_type, tdf,
                                          enable_garch, inputs, iterations, seed)
@@ -113,52 +211,52 @@ class ProfessionalMCModel:
         # Calculate statistics
         return calculate_stats(returns)
 
-def _run_sequential(self, mu, sigma, horizon, mean_reversion, dist_type, tdf,
-                    enable_garch, inputs, iterations, base_seed) -> List[float]:
-    """Run simulations sequentially"""
-    logger.info(f"Running sequential simulation with {iterations} iterations")
-    
-    returns = []
-    garch_omega = inputs.get('garchOmega', 0.0001) if enable_garch else 0
-    garch_alpha = inputs.get('garchAlpha', 0.08) if enable_garch else 0
-    garch_beta = inputs.get('garchBeta', 0.90) if enable_garch else 0
-    skew = inputs.get('skew', DISTRIBUTION_CONFIG[dist_type].get('default_skew', 0.2) if dist_type == 'skewt' else 0.0)
-    
-    progress_bar = st.progress(0)
-    for i in range(iterations):
-        args = (
-            mu, sigma, horizon, mean_reversion, dist_type, tdf,
-            enable_garch, garch_omega, garch_alpha, garch_beta, skew,
-            (base_seed + i) if base_seed is not None else None
-        )
-        returns.append(_simulate_path(args))
-        progress_bar.progress((i + 1) / iterations)
-    
-    return returns
+    def _run_sequential(self, mu, sigma, horizon, mean_reversion, dist_type, tdf,
+                       enable_garch, inputs, iterations, base_seed) -> List[float]:
+        """Run simulations sequentially"""
+        logger.info(f"Running sequential simulation with {iterations} iterations")
+        
+        returns = []
+        garch_omega = inputs.get('garchOmega', 0.0001) if enable_garch else 0
+        garch_alpha = inputs.get('garchAlpha', 0.08) if enable_garch else 0
+        garch_beta = inputs.get('garchBeta', 0.90) if enable_garch else 0
+        skew = inputs.get('skew', DISTRIBUTION_CONFIG[dist_type].get('default_skew', 0.2) if dist_type == 'skewt' else 0.0)
+        
+        progress_bar = st.progress(0)
+        for i in range(iterations):
+            args = (
+                mu, sigma, horizon, mean_reversion, dist_type, tdf,
+                enable_garch, garch_omega, garch_alpha, garch_beta, skew,
+                (base_seed + i) if base_seed is not None else None
+            )
+            returns.append(_simulate_path(args))
+            progress_bar.progress((i + 1) / iterations)
+        
+        return returns
 
-def _run_parallel(self, mu, sigma, horizon, mean_reversion, dist_type, tdf,
-                  enable_garch, inputs, iterations, base_seed) -> List[float]:
-    """Run simulations in parallel using multiprocessing"""
-    logger.info(f"Running parallel simulation with {self.n_processes} processes")
-    
-    garch_omega = inputs.get('garchOmega', 0.0001) if enable_garch else 0
-    garch_alpha = inputs.get('garchAlpha', 0.08) if enable_garch else 0
-    garch_beta = inputs.get('garchBeta', 0.90) if enable_garch else 0
-    skew = inputs.get('skew', DISTRIBUTION_CONFIG[dist_type].get('default_skew', 0.2) if dist_type == 'skewt' else 0.0)
-    
-    args_list = [
-        (
-            mu, sigma, horizon, mean_reversion, dist_type, tdf,
-            enable_garch, garch_omega, garch_alpha, garch_beta, skew,
-            (base_seed + i) if base_seed is not None else None
-        )
-        for i in range(iterations)
-    ]
-    
-    with Pool(processes=self.n_processes) as pool:
-        returns = pool.map(_simulate_path, args_list)
-    
-    return returns
+    def _run_parallel(self, mu, sigma, horizon, mean_reversion, dist_type, tdf,
+                     enable_garch, inputs, iterations, base_seed) -> List[float]:
+        """Run simulations in parallel using multiprocessing"""
+        logger.info(f"Running parallel simulation with {self.n_processes} processes")
+        
+        garch_omega = inputs.get('garchOmega', 0.0001) if enable_garch else 0
+        garch_alpha = inputs.get('garchAlpha', 0.08) if enable_garch else 0
+        garch_beta = inputs.get('garchBeta', 0.90) if enable_garch else 0
+        skew = inputs.get('skew', DISTRIBUTION_CONFIG[dist_type].get('default_skew', 0.2) if dist_type == 'skewt' else 0.0)
+        
+        args_list = [
+            (
+                mu, sigma, horizon, mean_reversion, dist_type, tdf,
+                enable_garch, garch_omega, garch_alpha, garch_beta, skew,
+                (base_seed + i) if base_seed is not None else None
+            )
+            for i in range(iterations)
+        ]
+        
+        with Pool(processes=self.n_processes) as pool:
+            returns = pool.map(_simulate_path, args_list)
+        
+        return returns
 
     def backtest(self, inputs: Dict) -> Dict:
         """
@@ -174,45 +272,33 @@ def _run_parallel(self, mu, sigma, horizon, mean_reversion, dist_type, tdf,
         logger.info(f"Starting backtest with {len(historical_data)} historical periods")
         
         predictions = []
+        horizon = inputs['horizon']  # Use user-specified horizon
+        iterations = inputs.get('iters', 1000)  # Use user iterations, default 1000
         
-        # Walk-forward: use data up to period i to predict period i+1
         for i in range(len(historical_data) - 1):
-            # Create inputs for this iteration
             temp_inputs = inputs.copy()
-            temp_inputs['iters'] = 1000  # Reduce iterations for speed
+            temp_inputs['iters'] = iterations
             
-            # Use historical volatility if we have enough data
             if i > 0:
                 hist_vol = np.std(historical_data[:i+1])
                 temp_inputs['baseSigma'] = max(VALIDATION['min_sigma'], hist_vol)
             
-            # Run simulation
             try:
                 result = self.run(temp_inputs)
                 predictions.append(result['stats']['mean'])
                 logger.debug(f"Backtest period {i+1}: predicted {result['stats']['mean']:.2f}%")
             except Exception as e:
                 logger.warning(f"Backtest period {i+1} failed: {e}")
-                # Use previous prediction or baseline
-                if predictions:
-                    predictions.append(predictions[-1])
-                else:
-                    predictions.append(inputs.get('baseMu', 0))
+                predictions.append(predictions[-1] if predictions else inputs.get('baseMu', 0))
         
-        # Align predictions with actuals
         actuals = historical_data[1:]
         errors = np.array(predictions) - np.array(actuals)
         
-        # Calculate metrics
         mae = np.mean(np.abs(errors))
         rmse = np.sqrt(np.mean(errors ** 2))
-        
-        # R² calculation
         ss_res = np.sum(errors ** 2)
         ss_tot = np.sum((actuals - np.mean(actuals)) ** 2)
         r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
-        
-        # Hit rate: correct direction prediction
         hit_rate = np.mean(np.sign(predictions) == np.sign(actuals))
         
         logger.info(f"Backtest complete: R²={r2:.3f}, MAE={mae:.2f}%, Hit Rate={hit_rate*100:.1f}%")
