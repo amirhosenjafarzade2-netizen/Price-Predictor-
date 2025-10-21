@@ -69,6 +69,10 @@ def calculate_stats(returns: Union[List[float], np.ndarray, Dict]) -> Dict:
     if np.max(np.abs(returns)) > 1000:
         logger.warning(f"Extreme returns detected: min={np.min(returns):.2f}%, max={np.max(returns):.2f}%")
     
+    if np.all(returns >= 0):
+        logger.error("All returns are non-negative; simulation may be biased")
+        raise ValueError("Simulation produced only positive returns, which is unrealistic")
+    
     sorted_returns = np.sort(returns)
     
     stats = {
@@ -76,7 +80,7 @@ def calculate_stats(returns: Union[List[float], np.ndarray, Dict]) -> Dict:
         'median': float(np.median(returns)),
         'stdDev': float(np.std(returns, ddof=1)),
         'skew': float(pd.Series(returns).skew()) if len(returns) > 2 else 0.0,
-        'kurtosis': float(pd.Series(returns).kurtosis() + 3.0) if len(returns) > 3 else 3.0,  # Raw kurtosis
+        'kurtosis': float(pd.Series(returns).kurtosis() + 3.0) if len(returns) > 3 else 3.0,
         'pPos': float(np.mean(returns > 0) * 100),
         'min': float(np.min(returns)),
         'max': float(np.max(returns)),
@@ -128,6 +132,7 @@ def calculate_sortino(returns: np.ndarray, target: float = 0) -> float:
     downside_returns = excess_returns[excess_returns < 0]
     
     if len(downside_returns) == 0 or np.mean(downside_returns ** 2) < 1e-6:
+        logger.warning("No downside returns for Sortino ratio; returning 0.0")
         return 0.0
     
     downside_dev = np.sqrt(np.mean(downside_returns ** 2))
@@ -167,6 +172,7 @@ def calculate_gain_loss_ratio(returns: np.ndarray) -> float:
     losses = returns[returns < 0]
     
     if len(gains) == 0 or len(losses) == 0:
+        logger.warning("No losses for gain/loss ratio; returning 1.0")
         return 1.0
     
     avg_gain = np.mean(gains)
