@@ -1,0 +1,279 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.express as px
+import plotly.graph_objects as go
+from datetime import datetime
+import base64
+from io import BytesIO
+from mc_model import ProfessionalMCModel
+from ga_optimizer import GeneticOptimizer
+from utils import parse_returns, calculate_stats, create_convergence_plot
+from config import ASSET_PRESETS, PARAMETER_BOUNDS
+
+st.set_page_config(page_title="Monte Carlo Asset Predictor", layout="wide")
+
+def main():
+    st.title("🎯 Professional Monte Carlo Asset Predictor")
+    st.caption("Enterprise-grade: Fat-tailed distributions • GARCH volatility • Mean reversion • Full backtesting")
+
+    # Initialize session state
+    if 'results' not in st.session_state:
+        st.session_state.results = None
+    if 'backtest_results' not in st.session_state:
+        st.session_state.backtest_results = None
+
+    # Sidebar for mode selection and period settings
+    with st.sidebar:
+        st.header("Settings")
+        mode = st.selectbox("Analysis Mode", ["Monte Carlo", "Genetic Algorithm"])
+        period_unit = st.selectbox("Period Unit", ["Day", "Month", "3 Months", "4 Months", "Year"])
+        period_count = st.number_input("Number of Periods", min_value=1, max_value=100, value=10, step=1)
+
+    # Main layout
+    col1, col2 = st.columns([2, 1])
+
+    with col1:
+        st.subheader("1) Asset Configuration")
+        asset_type = st.selectbox("Asset Type", list(ASSET_PRESETS.keys()), format_func=lambda x: ASSET_PRESETS[x]['name'])
+        
+        hist_returns = st.text_area(
+            "Historical Returns (%)",
+            placeholder="e.g. 8.2, -3.1, 12.5, 7.8, -1.2, ...",
+            value="10.3, -5.2, 18.7, 6.1, 12.2, 4.0, -8.1, 22.4, 9.9, 3.6, 15.2, -2.8, 11.5, 7.3, 13.8",
+            help="Enter yearly returns separated by commas"
+        )
+
+        col_mean, col_sigma, col_reversion = st.columns(3)
+        with col_mean:
+            baseline_mean = st.number_input("Baseline μ (%)", step=0.01, value=ASSET_PRESETS[asset_type]['mean'])
+        with col_sigma:
+            baseline_sigma = st.number_input("Baseline σ (%)", step=0.01, value=ASSET_PRESETS[asset_type]['sigma'])
+        with col_reversion:
+            mean_reversion = st.number_input("Mean Reversion φ", min_value=0.0, max_value=0.95, step=0.01, value=ASSET_PRESETS[asset_type]['meanReversion'])
+
+        st.subheader("2) Macro Environment")
+        if st.button("📡 Fetch Live Data"):
+            st.warning("Live data fetching not implemented in this version")
+
+        col_real, col_exp_real, col_infl = st.columns(3)
+        with col_real:
+            real_rate = st.number_input("Real Rate (%)", step=0.01, value=2.1, key="real_rate")
+        with col_exp_real:
+            exp_real_rate = st.number_input("Exp. Real Rate (%)", step=0.01, value=1.8, key="exp_real_rate")
+        with col_infl:
+            infl_exp = st.number_input("Inflation Exp. (%)", step=0.01, value=2.3, key="infl_exp")
+
+        col_vix, col_dxy, col_credit = st.columns(3)
+        with col_vix:
+            vix = st.number_input("VIX", step=0.1, min_value=5.0, max_value=100.0, value=15.5, key="vix")
+        with col_dxy:
+            dxy = st.number_input("DXY", step=0.1, min_value=70.0, max_value=150.0, value=103.2, key="dxy")
+        with col_credit:
+            credit_spread = st.number_input("Credit Spread (bps)", step=1.0, min_value=0.0, max_value=500.0, value=85.0, key="credit_spread")
+
+        col_term, col_horizon = st.columns(2)
+        with col_term:
+            term_spread = st.number_input("Term Spread (bps)", step=1.0, value=45.0, key="term_spread")
+        with col_horizon:
+            horizon = st.number_input("Forecast Horizon (years)", min_value=0.25, max_value=30.0, step=0.25, value=float(period_count))
+
+        # Advanced settings
+        with st.expander("⚙️ Advanced Settings"):
+            iterations = st.slider("Iterations", 1000, 100000, 10000, step=1000)
+            seed = st.number_input("Random Seed", min_value=0, step=1, value=None, key="seed")
+            dist_type = st.selectbox("Distribution Type", ["normal", "t", "skewt"], index=1)
+            tdf = st.number_input("t DoF", min_value=2.5, max_value=30.0, step=0.5, value=5.0)
+            
+            st.subheader("Sensitivity Coefficients (Betas)")
+            col_beta1, col_beta2 = st.columns(2)
+            betas = {}
+            for param, value in ASSET_PRESETS[asset_type]['betas'].items():
+                with col_beta1 if len(betas) % 2 == 0 else col_beta2:
+                    betas[param] = st.number_input(f"{param.capitalize()} Beta", 
+                                                min_value=PARAMETER_BOUNDS[f"beta_{param}"][0],
+                                                max_value=PARAMETER_BOUNDS[f"beta_{param}"][1],
+                                                step=0.01, value=value, key=f"beta_{param}")
+
+            st.subheader("Dynamic Correlations")
+            col_corr1, col_corr2 = st.columns(2)
+            with col_corr1:
+                corr_vix_infl = st.number_input("VIX-Inflation Corr", min_value=-1.0, max_value=1.0, step=0.01, value=0.25)
+                corr_real_vix = st.number_input("Real Rate-VIX Corr", min_value=-1.0, max_value=1.0, step=0.01, value=-0.15)
+            with col_corr2:
+                corr_credit_vix = st.number_input("Credit-VIX Corr", min_value=-1.0, max_value=1.0, step=0.01, value=0.40)
+
+            st.subheader("GARCH Volatility Clustering")
+            enable_garch = st.selectbox("Enable GARCH(1,1)", ["Disabled", "Enabled"], index=0) == "Enabled"
+            col_garch1, col_garch2, col_garch3 = st.columns(3)
+            with col_garch1:
+                garch_omega = st.number_input("ω (omega)", step=0.0001, value=0.0001)
+            with col_garch2:
+                garch_alpha = st.number_input("α (alpha)", step=0.01, value=0.08)
+            with col_garch3:
+                garch_beta = st.number_input("β (beta)", step=0.01, value=0.90)
+
+        # Control buttons
+        col_run, col_backtest, col_export = st.columns(3)
+        with col_run:
+            run_button = st.button("⚡ Run Simulation")
+        with col_backtest:
+            backtest_button = st.button("🧪 Run Backtest")
+        with col_export:
+            export_button = st.button("📥 Export Results")
+
+    with col2:
+        st.subheader("📊 Simulation Results")
+        results_placeholder = st.empty()
+        backtest_placeholder = st.empty()
+
+    # Initialize model
+    model = ProfessionalMCModel()
+
+    # Prepare inputs
+    inputs = {
+        'baseMu': baseline_mean if baseline_mean else None,
+        'baseSigma': baseline_sigma if baseline_sigma else None,
+        'realRate': real_rate if real_rate else None,
+        'expRealRate': exp_real_rate if exp_real_rate else None,
+        'inflExp': infl_exp if infl_exp else None,
+        'vix': vix if vix else None,
+        'dxy': dxy if dxy else None,
+        'creditSpread': credit_spread if credit_spread else None,
+        'termSpread': term_spread if term_spread else None,
+        'horizon': horizon,
+        'iters': iterations,
+        'seed': seed,
+        'distType': dist_type,
+        'tdf': tdf,
+        'meanReversion': mean_reversion,
+        'enableGarch': enable_garch,
+        'garchOmega': garch_omega,
+        'garchAlpha': garch_alpha,
+        'garchBeta': garch_beta,
+        'betas': betas,
+        'corrVixInfl': corr_vix_infl,
+        'corrRealVix': corr_real_vix,
+        'corrCreditVix': corr_credit_vix
+    }
+
+    # Run simulation
+    if run_button:
+        with st.spinner("Running simulation..."):
+            if mode == "Monte Carlo":
+                try:
+                    results = model.run(inputs)
+                    st.session_state.results = results
+                    st.success(f"✅ {iterations} simulations complete!")
+                except Exception as e:
+                    st.error(f"Error: {str(e)}")
+            else:
+                try:
+                    historical_data = parse_returns(hist_returns)
+                    if len(historical_data) < 2:
+                        st.error("Need at least 2 historical returns")
+                    else:
+                        optimizer = GeneticOptimizer(model, historical_data)
+                        results = optimizer.optimize(inputs)
+                        st.session_state.results = optimizer.export_results(results)
+                        st.success(f"✅ Genetic Algorithm optimization complete! Validation Score: {st.session_state.results['validationScore']:.3f}")
+                except Exception as e:
+                    st.error(f"Error: {str(e)}")
+
+    # Run backtest
+    if backtest_button:
+        with st.spinner("Running backtest..."):
+            try:
+                inputs['horizon'] = 1
+                inputs['iters'] = 1000
+                inputs['seed'] = 12345
+                backtest_results = model.backtest(inputs)
+                st.session_state.backtest_results = backtest_results
+                st.success(f"✅ Backtest complete! R²: {backtest_results['stats']['r2']:.3f}")
+            except Exception as e:
+                st.error(f"Error: {str(e)}")
+
+    # Display results
+    if st.session_state.results:
+        results = st.session_state.results
+        stats = results['stats'] if mode == "Monte Carlo" else calculate_stats(results['optimizedBetas'])
+        risk_metrics = results['riskMetrics'] if mode == "Monte Carlo" else calculate_stats(results['optimizedBetas'])['riskMetrics']
+        percentiles = results['percentiles'] if mode == "Monte Carlo" else calculate_stats(results['optimizedBetas'])['percentiles']
+
+        with results_placeholder.container():
+            fig = px.histogram(results['results'] if mode == "Monte Carlo" else results['optimizedBetas'].values(),
+                             title="Return Distribution",
+                             labels={'value': 'Return (%)'})
+            st.plotly_chart(fig, use_container_width=True)
+
+            st.subheader("Key Statistics")
+            col_stats1, col_stats2, col_stats3 = st.columns(3)
+            with col_stats1:
+                st.metric("Mean Return", f"{stats['mean']:.2f}%")
+                st.metric("Volatility", f"{stats['stdDev']:.2f}%")
+            with col_stats2:
+                st.metric("VaR 95%", f"-{risk_metrics['var95']:.2f}%")
+                st.metric("CVaR 95%", f"-{risk_metrics['cvar95']:.2f}%")
+            with col_stats3:
+                st.metric("Sharpe Ratio", f"{risk_metrics['sharpe']:.2f}")
+                st.metric("Max Drawdown", f"{risk_metrics['maxDD']:.1f}%")
+
+            st.subheader("Percentiles")
+            col_p1, col_p2, col_p3 = st.columns(3)
+            with col_p1:
+                st.metric("1st Percentile", f"{percentiles['p01']:.1f}%")
+                st.metric("25th Percentile", f"{percentiles['p25']:.1f}%")
+            with col_p2:
+                st.metric("5th Percentile", f"{percentiles['p05']:.1f}%")
+                st.metric("50th Percentile", f"{percentiles['p50']:.1f}%")
+            with col_p3:
+                st.metric("10th Percentile", f"{percentiles['p10']:.1f}%")
+                st.metric("75th Percentile", f"{percentiles['p75']:.1f}%")
+
+            if mode == "Genetic Algorithm":
+                st.subheader("Convergence History")
+                st.plotly_chart(create_convergence_plot(results['diagnostics']['fitnessProgress']))
+
+    # Display backtest results
+    if st.session_state.backtest_results:
+        with backtest_placeholder.container():
+            st.subheader("Backtest Results")
+            backtest_results = st.session_state.backtest_results
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=backtest_results['years'], y=backtest_results['actuals'], name="Actual", line=dict(color="#28a745")))
+            fig.add_trace(go.Scatter(x=backtest_results['years'], y=backtest_results['predictions'], name="Predicted", line=dict(color="#0b74de")))
+            fig.update_layout(title="Backtest: Actual vs Predicted Returns", xaxis_title="Year", yaxis_title="Return (%)")
+            st.plotly_chart(fig, use_container_width=True)
+
+            col_backtest1, col_backtest2 = st.columns(2)
+            with col_backtest1:
+                st.metric("MAE", f"{backtest_results['stats']['mae']:.2f}%")
+                st.metric("RMSE", f"{backtest_results['stats']['rmse']:.2f}%")
+            with col_backtest2:
+                st.metric("R²", f"{backtest_results['stats']['r2']:.3f}")
+                st.metric("Hit Rate", f"{backtest_results['stats']['hitRate']*100:.1f}%")
+
+    # Export results
+    if export_button and st.session_state.results:
+        results = st.session_state.results
+        df = pd.DataFrame({
+            'Metric': ['Mean Return', 'Volatility', 'VaR 95%', 'CVaR 95%', 'Sharpe Ratio', 'Max Drawdown'],
+            'Value': [
+                f"{stats['mean']:.2f}%",
+                f"{stats['stdDev']:.2f}%",
+                f"-{risk_metrics['var95']:.2f}%",
+                f"-{risk_metrics['cvar95']:.2f}%",
+                f"{risk_metrics['sharpe']:.2f}",
+                f"{risk_metrics['maxDD']:.1f}%"
+            ]
+        })
+        csv = df.to_csv(index=False)
+        st.download_button(
+            label="Download CSV",
+            data=csv,
+            file_name=f"mc_results_{datetime.now().strftime('%Y%m%d')}.csv",
+            mime="text/csv"
+        )
+
+if __name__ == "__main__":
+    main()
