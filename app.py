@@ -183,7 +183,7 @@ def main():
             baseline_mean = st.number_input(
                 "Baseline μ (%)",
                 step=0.01,
-                value=ASSET_PRESETS[asset_type]['mean'],
+                value=st.session_state.get('_random_baseline_mean', ASSET_PRESETS[asset_type]['mean']),
                 key="baseline_mean",
                 help="Expected annual return"
             )
@@ -192,7 +192,7 @@ def main():
                 "Baseline σ (%)",
                 step=0.01,
                 min_value=VALIDATION['min_sigma'],
-                value=ASSET_PRESETS[asset_type]['sigma'],
+                value=st.session_state.get('_random_baseline_sigma', ASSET_PRESETS[asset_type]['sigma']),
                 key="baseline_sigma",
                 help="Annual volatility (standard deviation)"
             )
@@ -202,7 +202,7 @@ def main():
                 min_value=0.0,
                 max_value=PARAMETER_BOUNDS['mean_reversion'][1],
                 step=0.01,
-                value=ASSET_PRESETS[asset_type]['meanReversion'],
+                value=st.session_state.get('_random_mean_reversion', ASSET_PRESETS[asset_type]['meanReversion']),
                 key="mean_reversion",
                 help="Speed of reversion to mean (0=none, 1=instant)"
             )
@@ -220,7 +220,7 @@ def main():
         # Toggle between single current macro or historical macro data
         macro_input_mode = st.radio(
             "Macro Data Input Mode",
-            ["Current Only (for forecasting, monte carlo)", "Historical (for each period, genetic algorithm)"],
+            ["Current Only (for forecasting)", "Historical (for each period)"],
             help="Current: Single set of macro conditions for forecast | Historical: Macro conditions for each historical period"
         )
         
@@ -663,25 +663,41 @@ def main():
 
         # Randomize button
         if st.button("🎲 Randomize Inputs", use_container_width=True):
-            st.session_state.baseline_mean = random.uniform(0, 15)
-            st.session_state.baseline_sigma = random.uniform(5, 25)
-            st.session_state.mean_reversion = random.uniform(0, PARAMETER_BOUNDS['mean_reversion'][1])
+            # Store random values with different keys to avoid widget conflicts
+            st.session_state['_random_baseline_mean'] = random.uniform(0, 15)
+            st.session_state['_random_baseline_sigma'] = random.uniform(5, 25)
+            st.session_state['_random_mean_reversion'] = random.uniform(0, PARAMETER_BOUNDS['mean_reversion'][1])
             
             if macro_input_mode == "Current Only (for forecasting)":
-                st.session_state.real_rate = random.uniform(-2, 5)
-                st.session_state.exp_real_rate = random.uniform(-2, 5)
-                st.session_state.infl_exp = random.uniform(0, 6)
-                st.session_state.vix = random.uniform(5, 100)
-                st.session_state.dxy = random.uniform(70, 150)
-                st.session_state.credit_spread = random.uniform(0, 500)
-                st.session_state.term_spread = random.uniform(-100, 100)
+                st.session_state['_random_real_rate'] = random.uniform(-2, 5)
+                st.session_state['_random_exp_real_rate'] = random.uniform(-2, 5)
+                st.session_state['_random_infl_exp'] = random.uniform(0, 6)
+                st.session_state['_random_vix'] = random.uniform(5, 100)
+                st.session_state['_random_dxy'] = random.uniform(70, 150)
+                st.session_state['_random_credit_spread'] = random.uniform(0, 500)
+                st.session_state['_random_term_spread'] = random.uniform(-100, 100)
+            else:
+                # Randomize historical macro data
+                if num_historical_periods > 0:
+                    st.session_state.historical_macro_data = [
+                        {
+                            'realRate': random.uniform(-2, 5),
+                            'expRealRate': random.uniform(-2, 5),
+                            'inflExp': random.uniform(0, 6),
+                            'vix': random.uniform(5, 100),
+                            'dxy': random.uniform(70, 150),
+                            'creditSpread': random.uniform(0, 500),
+                            'termSpread': random.uniform(-100, 100)
+                        }
+                        for _ in range(num_historical_periods)
+                    ]
             
             for param in ASSET_PRESETS[asset_type]['betas']:
                 min_val, max_val = PARAMETER_BOUNDS[f"beta_{param}"]
-                st.session_state[f"beta_{param}"] = random.uniform(min_val, max_val)
+                st.session_state[f'_random_beta_{param}'] = random.uniform(min_val, max_val)
             
-            if use_seed:
-                st.session_state.seed = random.randint(0, 1000000)
+            if 'seed' in st.session_state:
+                st.session_state['_random_seed'] = random.randint(0, 1000000)
             
             logger.info("Inputs randomized")
             st.rerun()
