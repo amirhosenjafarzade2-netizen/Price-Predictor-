@@ -1,8 +1,17 @@
+"""
+Enhanced Genetic Algorithm Optimizer with caching
+Optimizes Monte Carlo parameters to match historical data
+"""
+
 import numpy as np
 import random
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
-from config import PARAMETER_BOUNDS, GA_CONFIG, VALIDATION
+from config import PARAMETER_BOUNDS, GA_CONFIG, VALIDATION, PERFORMANCE_CONFIG
+import logging
+from functools import lru_cache
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -27,6 +36,16 @@ class Individual:
             'credit': self.beta_credit,
             'term': self.beta_term
         }
+    
+    def to_tuple(self) -> tuple:
+        """Convert to tuple for hashing (cache key)"""
+        return tuple(round(v, 6) for v in self.__dict__.values())
+    
+    def __hash__(self):
+        return hash(self.to_tuple())
+    
+    def __eq__(self, other):
+        return self.to_tuple() == other.to_tuple()
 
 
 @dataclass
@@ -38,27 +57,51 @@ class GAResult:
     convergence_history: List[Dict]
     improvement: Dict[str, float]
     converged_at: int
-    final_returns: List[float]  # Actual simulated returns from best individual
+    final_returns: List[float]
+    cache_hit_rate: float
 
 
 class GeneticOptimizer:
-    """Genetic Algorithm for MC parameter optimization"""
+    """
+    Genetic Algorithm for MC parameter optimization
+    
+    Features:
+    - Fitness caching for performance
+    - Early stopping on convergence
+    - Adaptive mutation rates
+    - Elite preservation
+    - Tournament selection
+    
+    Example:
+        >>> optimizer = GeneticOptimizer(model, historical_data)
+        >>> results = optimizer.optimize(base_inputs, historical_data)
+        >>> print(f"Validation score: {results.validation_score:.3f}")
+    """
     
     def __init__(self, mc_model, historical_data: List[float]):
         self.model = mc_model
         self.historical_data = np.array(historical_data)
         self.bounds = PARAMETER_BOUNDS.copy()
         
+        # Fitness cache for performance
+        self.fitness_cache = {}
+        self.cache_hits = 0
+        self.cache_misses = 0
+        
+        logger.info(
+            f"GA Optimizer initialized with {len(historical_data)} historical points"
+        )
+        
     def optimize(
         self,
         base_inputs: Dict,
         historical_data: List[float],
-        generations: int = 50,
-        population_size: int = 100,
-        elite_ratio: float = 0.2,
-        mutation_rate: float = 0.15,
-        mutation_strength: float = 0.1,
-        validation_split: float = 0.3
+        generations: Optional[int] = None,
+        population_size: Optional[int] = None,
+        elite_ratio: Optional[float] = None,
+        mutation_rate: Optional[float] = None,
+        mutation_strength: Optional[float] = None,
+        validation_split: Optional[float] = None
     ) -> GAResult:
         """
         Main optimization loop
@@ -66,16 +109,24 @@ class GeneticOptimizer:
         Args:
             base_inputs: Dictionary with baseline parameters
             historical_data: Historical returns for training
-            generations: Number of generations to evolve
-            population_size: Size of population
-            elite_ratio: Fraction of population to keep as elites
-            mutation_rate: Probability of mutation per gene
-            mutation_strength: Magnitude of mutations
-            validation_split: Fraction of data for validation
+            generations: Number of generations (default from config)
+            population_size: Size of population (default from config)
+            elite_ratio: Fraction of elites (default from config)
+            mutation_rate: Mutation probability (default from config)
+            mutation_strength: Mutation magnitude (default from config)
+            validation_split: Validation fraction (default from config)
             
         Returns:
             GAResult with optimized parameters and diagnostics
         """
+        # Use config defaults if not specified
+        generations = generations or GA_CONFIG['default_generations']
+        population_size = population_size or GA_CONFIG['default_population']
+        elite_ratio = elite_ratio or GA_CONFIG['elite_ratio']
+        mutation_rate = mutation_rate or GA_CONFIG['mutation_rate']
+        mutation_strength = mutation_strength or GA_CONFIG['mutation_strength']
+        validation_split = validation_split or GA_CONFIG['validation_split']
+        
         # Validate minimum data requirements
         if len(historical_data) < VALIDATION['min_returns_ga']:
             raise ValueError(
@@ -92,7 +143,20 @@ class GeneticOptimizer:
         valid_data = self.historical_data[split_idx:]
         
         if len(valid_data) == 0:
-            valid_data = train_data[-1:]  # Use last training point for validation
+            valid_data = train_data[-1:]
+        
+        logger.info(
+            f"Starting GA optimization: {generations} generations, "
+            f"population {population_size}"
+        )
+        logger.info(
+            f"Training: {len(train_data)} points, Validation: {len(valid_data)} points"
+        )
+        
+        # Clear cache for new optimization
+        self.fitness_cache.clear()
+        self.cache_hits = 0
+        self.cache_misses = 0
         
         # Initialize population
         population = self._initialize_population(base_inputs, population_size)
@@ -100,14 +164,12 @@ class GeneticOptimizer:
         best_fitness = -np.inf
         best_individual = None
         convergence_history = []
-        
-        print(f"🧬 Starting GA: {generations} generations, population {population_size}")
-        print(f"Training on {len(train_data)} points, validating on {len(valid_data)} points")
+        stagnation_counter = 0
         
         for gen in range(generations):
             # Evaluate fitness for all individuals
             fitnesses = [
-                self._evaluate_fitness(ind, base_inputs, train_data)
+                self._evaluate_fitness_cached(ind, base_inputs, train_data)
                 for ind in population
             ]
             
@@ -119,12 +181,17 @@ class GeneticOptimizer:
             )
             
             # Track best individual
-            if ranked[0][1] > best_fitness:
-                best_fitness = ranked[0][1]
+            current_best_fitness = ranked[0][1]
+            if current_best_fitness > best_fitness:
+                best_fitness = current_best_fitness
                 best_individual = ranked[0][0]
+                stagnation_counter = 0
+                logger.debug(f"New best fitness: {best_fitness:.4f}")
+            else:
+                stagnation_counter += 1
             
             # Validate on holdout set
-            valid_fitness = self._evaluate_fitness(
+            valid_fitness = self._evaluate_fitness_cached(
                 ranked[0][0], base_inputs, valid_data
             )
             
@@ -135,7 +202,7 @@ class GeneticOptimizer:
             # Record history
             convergence_history.append({
                 'generation': gen,
-                'train': ranked[0][1],
+                'train': current_best_fitness,
                 'valid': valid_fitness,
                 'avg_fitness': avg_fitness,
                 'diversity': diversity
@@ -143,24 +210,32 @@ class GeneticOptimizer:
             
             # Log progress
             if gen % 10 == 0 or gen == generations - 1:
-                print(
-                    f"Gen {gen}: Best={ranked[0][1]:.4f}, "
+                cache_rate = self.cache_hits / max(1, self.cache_hits + self.cache_misses)
+                logger.info(
+                    f"Gen {gen}: Best={current_best_fitness:.4f}, "
                     f"Valid={valid_fitness:.4f}, "
                     f"Avg={avg_fitness:.4f}, "
-                    f"Diversity={diversity:.3f}"
+                    f"Diversity={diversity:.3f}, "
+                    f"Cache hit rate={cache_rate:.1%}"
                 )
             
             # Early stopping if converged
             if gen > 20 and self._has_converged(convergence_history):
-                print(f"✅ Converged at generation {gen}")
+                logger.info(f"✅ Converged at generation {gen}")
                 break
+            
+            # Adaptive mutation: increase if stagnating
+            adaptive_mutation = mutation_rate
+            if stagnation_counter > 5:
+                adaptive_mutation = min(0.5, mutation_rate * 1.5)
+                logger.debug(f"Increased mutation rate to {adaptive_mutation:.2f} due to stagnation")
             
             # Evolve next generation
             population = self._evolve(
                 ranked,
                 population_size,
                 elite_ratio,
-                mutation_rate,
+                adaptive_mutation,
                 mutation_strength
             )
         
@@ -170,6 +245,13 @@ class GeneticOptimizer:
         # Calculate improvement over baseline
         improvement = self._calculate_improvement(base_inputs, best_individual)
         
+        # Calculate cache statistics
+        cache_hit_rate = self.cache_hits / max(1, self.cache_hits + self.cache_misses)
+        logger.info(
+            f"Optimization complete. Cache hit rate: {cache_hit_rate:.1%} "
+            f"({self.cache_hits} hits, {self.cache_misses} misses)"
+        )
+        
         return GAResult(
             best_individual=best_individual,
             best_fitness=best_fitness,
@@ -177,7 +259,8 @@ class GeneticOptimizer:
             convergence_history=convergence_history,
             improvement=improvement,
             converged_at=len(convergence_history),
-            final_returns=final_returns
+            final_returns=final_returns,
+            cache_hit_rate=cache_hit_rate
         )
     
     def _initialize_population(
@@ -188,7 +271,21 @@ class GeneticOptimizer:
         """Initialize random population around base parameters"""
         population = []
         
-        for _ in range(size):
+        # Always include the baseline individual
+        baseline = Individual(
+            beta_real=base_inputs['betas'].get('real', 0),
+            beta_exp_real=base_inputs['betas'].get('expReal', 0),
+            beta_infl=base_inputs['betas'].get('infl', 0),
+            beta_vix=base_inputs['betas'].get('vix', 0),
+            beta_dxy=base_inputs['betas'].get('dxy', 0),
+            beta_credit=base_inputs['betas'].get('credit', 0),
+            beta_term=base_inputs['betas'].get('term', 0),
+            mean_reversion=base_inputs.get('meanReversion', 0)
+        )
+        population.append(baseline)
+        
+        # Generate random individuals
+        for _ in range(size - 1):
             ind = Individual(
                 beta_real=self._random_in_bounds(
                     'beta_real', base_inputs['betas'].get('real', 0)
@@ -217,6 +314,7 @@ class GeneticOptimizer:
             )
             population.append(ind)
         
+        logger.debug(f"Initialized population of {size} individuals")
         return population
     
     def _random_in_bounds(self, param: str, base: float) -> float:
@@ -226,6 +324,32 @@ class GeneticOptimizer:
         variation = range_val * 0.3  # 30% of range for initial diversity
         value = base + (random.random() - 0.5) * variation
         return np.clip(value, min_val, max_val)
+    
+    def _evaluate_fitness_cached(
+        self,
+        individual: Individual,
+        base_inputs: Dict,
+        data: np.ndarray
+    ) -> float:
+        """Evaluate fitness with caching"""
+        if not PERFORMANCE_CONFIG.get('enable_caching', True):
+            return self._evaluate_fitness(individual, base_inputs, data)
+        
+        # Create cache key
+        cache_key = (individual.to_tuple(), tuple(data))
+        
+        if cache_key in self.fitness_cache:
+            self.cache_hits += 1
+            return self.fitness_cache[cache_key]
+        
+        self.cache_misses += 1
+        fitness = self._evaluate_fitness(individual, base_inputs, data)
+        
+        # Store in cache (with size limit)
+        if len(self.fitness_cache) < PERFORMANCE_CONFIG.get('cache_max_size', 1000):
+            self.fitness_cache[cache_key] = fitness
+        
+        return fitness
     
     def _evaluate_fitness(
         self,
@@ -247,7 +371,7 @@ class GeneticOptimizer:
             test_inputs = base_inputs.copy()
             test_inputs['betas'] = individual.to_dict()
             test_inputs['meanReversion'] = individual.mean_reversion
-            test_inputs['iters'] = 500  # Lower for speed during GA
+            test_inputs['iters'] = GA_CONFIG['fitness_iterations']
             
             # Run Monte Carlo with these parameters
             results = self.model.run(test_inputs)
@@ -278,8 +402,7 @@ class GeneticOptimizer:
             return fitness
             
         except Exception as e:
-            # Penalize invalid parameters heavily
-            print(f"Fitness evaluation error: {str(e)}")
+            logger.warning(f"Fitness evaluation error: {e}")
             return -1000.0
     
     def _get_simulated_returns(
@@ -295,7 +418,8 @@ class GeneticOptimizer:
             
             results = self.model.run(test_inputs)
             return results['results']
-        except Exception:
+        except Exception as e:
+            logger.error(f"Failed to get simulated returns: {e}")
             return []
     
     def _calculate_regularization(self, individual: Individual) -> float:
@@ -388,8 +512,8 @@ class GeneticOptimizer:
             parent1 = self._tournament_select(ranked)
             parent2 = self._tournament_select(ranked)
             
-            # Crossover (80% probability)
-            if random.random() < 0.8:
+            # Crossover
+            if random.random() < GA_CONFIG['crossover_probability']:
                 child = self._crossover(parent1, parent2)
             else:
                 child = parent1 if random.random() < 0.5 else parent2
@@ -404,9 +528,10 @@ class GeneticOptimizer:
     def _tournament_select(
         self,
         ranked: List[Tuple[Individual, float]],
-        tournament_size: int = 5
+        tournament_size: Optional[int] = None
     ) -> Individual:
         """Select an individual via tournament selection"""
+        tournament_size = tournament_size or GA_CONFIG['tournament_size']
         tournament = random.sample(ranked, min(tournament_size, len(ranked)))
         return max(tournament, key=lambda x: x[1])[0]
     
@@ -458,6 +583,7 @@ class GeneticOptimizer:
             'validationScore': results.validation_score,
             'improvement': results.improvement,
             'convergedAt': results.converged_at,
+            'cacheHitRate': results.cache_hit_rate,
             'stats': stats_result['stats'],
             'riskMetrics': stats_result['riskMetrics'],
             'percentiles': stats_result['percentiles'],
