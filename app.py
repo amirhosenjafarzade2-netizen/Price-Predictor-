@@ -220,7 +220,7 @@ def main():
         # Toggle between single current macro or historical macro data
         macro_input_mode = st.radio(
             "Macro Data Input Mode",
-            ["Current Only (for forecasting)", "Historical (for each period)"],
+            ["Current Only (for forecasting, monte carlo)", "Historical (for each period, genetic algorithm)"],
             help="Current: Single set of macro conditions for forecast | Historical: Macro conditions for each historical period"
         )
         
