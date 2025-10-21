@@ -3,7 +3,7 @@ import random
 from typing import Dict, List, Tuple
 from dataclasses import dataclass
 import streamlit as st
-from utils import validate_inputs
+from utils import validate_inputs, calculate_stats
 
 @dataclass
 class Individual:
@@ -53,12 +53,18 @@ class GeneticOptimizer:
         }
         
     @st.cache_data
-    def optimize(self, base_inputs: Dict, generations: int = 50, population_size: int = 100,
-                 elite_ratio: float = 0.2, mutation_rate: float = 0.15, mutation_strength: float = 0.1,
-                 validation_split: float = 0.3) -> GAResult:
-        if len(self.historical_data) < 2:
+    def optimize(self, base_inputs: Dict, historical_data: List[float], generations: int = 50, 
+                 population_size: int = 100, elite_ratio: float = 0.2, mutation_rate: float = 0.15, 
+                 mutation_strength: float = 0.1, validation_split: float = 0.3) -> GAResult:
+        # Validate inputs
+        is_valid, errors = validate_inputs(base_inputs)
+        if not is_valid:
+            raise ValueError("\n".join(errors))
+        
+        if len(historical_data) < 2:
             raise ValueError("Genetic Algorithm requires at least 2 historical returns")
         
+        self.historical_data = np.array(historical_data)  # Update instance variable for consistency
         split_idx = int(len(self.historical_data) * (1 - validation_split))
         train_data = self.historical_data[:split_idx]
         valid_data = self.historical_data[split_idx:]
@@ -134,16 +140,20 @@ class GeneticOptimizer:
             
             results = self.model.run(test_inputs)
             stats = results['stats']
+            risk_metrics = results['riskMetrics']
             
             hist_mean = np.mean(data)
             hist_std = np.std(data)
             
             mean_error = abs(stats['mean'] - hist_mean) / max(0.1, hist_std)
             std_error = abs(stats['stdDev'] - hist_std) / max(0.1, hist_std)
-            sharpe_score = np.clip(stats['sharpe'], 0, 3)
+            sharpe_score = np.clip(risk_metrics['sharpe'], 0, 3)
             regularization = self._calculate_regularization(individual)
             
             return -0.4 * mean_error - 0.3 * std_error + 0.2 * sharpe_score - 0.1 * regularization
+        except ValueError as e:
+            st.error(f"Fitness evaluation failed due to invalid inputs: {str(e)}")
+            return -1000.0
         except Exception as e:
             st.error(f"Fitness evaluation failed: {str(e)}")
             return -1000.0
@@ -179,7 +189,7 @@ class GeneticOptimizer:
     def _calculate_improvement(self, base_inputs: Dict, best_individual: Individual) -> Dict[str, float]:
         improvement = {}
         base_betas = base_inputs['betas']
-        optimized_betas = best_individual.to_doc()
+        optimized_betas = best_individual.to_dict()
         for param in base_betas.keys():
             improvement[param] = optimized_betas[param] - base_betas[param]
         improvement['mean_reversion'] = best_individual.mean_reversion - base_inputs['meanReversion']
