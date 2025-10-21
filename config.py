@@ -16,3 +16,14 @@ PARAMETER_BOUNDS = {
     'beta_term': (-0.1, 0.3),
     'mean_reversion': (0, 0.5)
 }
+
+UI_CONFIG = {
+    'chart_height': 400
+}
+
+VALIDATION = {
+    'min_horizon': 0.25,
+    'max_horizon': 30.0,
+    'min_returns': 2,
+    'min_tdf': 2.5
+}
