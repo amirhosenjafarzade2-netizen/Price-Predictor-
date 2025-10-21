@@ -73,16 +73,6 @@ def parse_returns(text: str) -> List[float]:
 
 
 def calculate_stats(returns: Union[List[float], np.ndarray, Dict]) -> Dict:
-    """
-    Calculate comprehensive statistics for return distribution
-    
-    Args:
-        returns: Array of returns (in %) or dict of returns
-        
-    Returns:
-        Dictionary containing stats, riskMetrics, percentiles, and results
-    """
-    # Handle dict input (from GA optimizer)
     if isinstance(returns, dict):
         returns = list(returns.values())
     
@@ -90,8 +80,6 @@ def calculate_stats(returns: Union[List[float], np.ndarray, Dict]) -> Dict:
         raise ValueError("No returns data provided")
     
     returns = np.array(returns, dtype=float)
-    
-    # Remove any NaN or inf values
     returns = returns[np.isfinite(returns)]
     
     if len(returns) == 0:
@@ -99,13 +87,12 @@ def calculate_stats(returns: Union[List[float], np.ndarray, Dict]) -> Dict:
     
     sorted_returns = np.sort(returns)
     
-    # Basic statistics
     stats = {
         'mean': float(np.mean(returns)),
         'median': float(np.median(returns)),
         'stdDev': float(np.std(returns, ddof=1)),
-        'skew': float(pd.Series(returns).skew()),
-        'kurtosis': float(pd.Series(returns).kurtosis()),
+        'skew': float(pd.Series(returns).skew()) if len(returns) > 2 else 0.0,
+        'kurtosis': float(pd.Series(returns).kurtosis()) if len(returns) > 3 else 0.0,
         'pPos': float(np.mean(returns > 0) * 100),
         'min': float(np.min(returns)),
         'max': float(np.max(returns)),
@@ -113,11 +100,10 @@ def calculate_stats(returns: Union[List[float], np.ndarray, Dict]) -> Dict:
         'iqr': float(np.percentile(returns, 75) - np.percentile(returns, 25))
     }
     
-    # Risk metrics
     var_95_idx = max(1, int(0.05 * len(sorted_returns)))
     var_99_idx = max(1, int(0.01 * len(sorted_returns)))
     
-    sharpe = (stats['mean'] - RISK_FREE_RATE) / stats['stdDev'] if stats['stdDev'] > 0 else 0
+    sharpe = (stats['mean'] - RISK_FREE_RATE) / stats['stdDev'] if stats['stdDev'] > 1e-6 else 0.0
     
     risk_metrics = {
         'var95': float(-np.percentile(returns, 5)),
@@ -132,7 +118,6 @@ def calculate_stats(returns: Union[List[float], np.ndarray, Dict]) -> Dict:
         'gainLossRatio': float(calculate_gain_loss_ratio(returns))
     }
     
-    # Percentiles
     percentiles = {
         f'p{str(p).zfill(2)}': float(np.percentile(returns, p))
         for p in [1, 5, 10, 25, 50, 75, 90, 95, 99]
@@ -147,45 +132,30 @@ def calculate_stats(returns: Union[List[float], np.ndarray, Dict]) -> Dict:
         'results': returns.tolist()
     }
 
-
 def calculate_sortino(returns: np.ndarray, target: float = 0) -> float:
-    """
-    Calculate Sortino ratio (return vs downside deviation)
-    
-    Only considers downside volatility (returns below target)
-    """
     excess_returns = returns - target
     downside_returns = excess_returns[excess_returns < 0]
     
-    if len(downside_returns) == 0:
+    if len(downside_returns) == 0 or np.mean(downside_returns ** 2) < 1e-6:
         return 0.0
     
     downside_dev = np.sqrt(np.mean(downside_returns ** 2))
-    
-    if downside_dev == 0:
-        return 0.0
-    
     return (np.mean(returns) - target) / downside_dev
 
-
 def calculate_calmar(returns: np.ndarray) -> float:
-    """Calculate Calmar ratio (return / max drawdown)"""
     max_dd = calculate_max_drawdown(returns)
-    if max_dd == 0:
+    if abs(max_dd) < 1e-6:
         return 0.0
     return np.mean(returns) / max_dd
 
-
 def calculate_max_drawdown(returns: np.ndarray) -> float:
-    """Calculate maximum drawdown from return series"""
     if len(returns) == 0:
         return 0.0
     
-    wealth = np.cumprod(1 + np.array(returns) / 100)
+    wealth = np.cumprod(1 + np.array(returns) / 100.0)  # Ensure percentage handling
     peak = np.maximum.accumulate(wealth)
     drawdowns = (peak - wealth) / peak
-    
-    return np.max(drawdowns) * 100
+    return np.max(drawdowns) * 100.0
 
 
 def calculate_tail_ratio(returns: np.ndarray) -> float:
