@@ -4,12 +4,10 @@ import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime
-import base64
-from io import BytesIO
 from mc_model import ProfessionalMCModel
 from ga_optimizer import GeneticOptimizer
-from utils import parse_returns, calculate_stats, create_convergence_plot, create_sensitivity_plot
-from config import ASSET_PRESETS, PARAMETER_BOUNDS
+from utils import parse_returns, calculate_stats, create_histogram_plot, create_convergence_plot, create_diversity_plot, create_backtest_plot, create_sensitivity_plot, validate_inputs, generate_summary_table
+from config import ASSET_PRESETS, PARAMETER_BOUNDS, UI_CONFIG, VALIDATION
 import random
 
 st.set_page_config(page_title="Monte Carlo Asset Predictor", layout="wide")
@@ -51,7 +49,7 @@ def main():
         with col_mean:
             baseline_mean = st.number_input("Baseline μ (%)", step=0.01, value=ASSET_PRESETS[asset_type]['mean'], key="baseline_mean")
         with col_sigma:
-            baseline_sigma = st.number_input("Baseline σ (%)", step=0.01, value=ASSET_PRESETS[asset_type]['sigma'], key="baseline_sigma")
+            baseline_sigma = st.number_input("Baseline σ (%)", step=0.01, min_value=0.01, value=ASSET_PRESETS[asset_type]['sigma'], key="baseline_sigma")
         with col_reversion:
             mean_reversion = st.number_input("Mean Reversion φ", min_value=0.0, max_value=0.95, step=0.01, value=ASSET_PRESETS[asset_type]['meanReversion'], key="mean_reversion")
 
@@ -79,14 +77,14 @@ def main():
         with col_term:
             term_spread = st.number_input("Term Spread (bps)", step=1.0, value=45.0, key="term_spread")
         with col_horizon:
-            horizon = st.number_input("Forecast Horizon (years)", min_value=0.25, max_value=30.0, step=0.25, value=float(period_count), key="horizon")
+            horizon = st.number_input("Forecast Horizon (years)", min_value=VALIDATION['min_horizon'], max_value=VALIDATION['max_horizon'], step=0.25, value=float(period_count), key="horizon")
 
         # Advanced settings
         with st.expander("⚙️ Advanced Settings"):
             iterations = st.slider("Iterations", 1000, 100000, 10000, step=1000)
             seed = st.number_input("Random Seed", min_value=0, step=1, value=None, key="seed")
             dist_type = st.selectbox("Distribution Type", ["normal", "t", "skewt"], index=1)
-            tdf = st.number_input("t DoF", min_value=2.5, max_value=30.0, step=0.5, value=5.0)
+            tdf = st.number_input("t DoF", min_value=VALIDATION['min_tdf'], max_value=30.0, step=0.5, value=5.0)
             
             st.subheader("Sensitivity Coefficients (Betas)")
             col_beta1, col_beta2 = st.columns(2)
@@ -118,10 +116,6 @@ def main():
             with col_garch3:
                 garch_beta = st.number_input("β (beta)", step=0.01, value=0.90, min_value=0.0, max_value=1.0)
 
-            # Validate GARCH parameters
-            if enable_garch and garch_alpha + garch_beta >= 1:
-                st.warning("GARCH parameters (α + β) must be < 1 for stability")
-
         # Control buttons
         col_run, col_backtest, col_sensitivity, col_export = st.columns(4)
         with col_run:
@@ -145,14 +139,14 @@ def main():
             st.session_state.dxy = random.uniform(70, 150)
             st.session_state.credit_spread = random.uniform(0, 500)
             st.session_state.term_spread = random.uniform(-100, 100)
-            st.session_state.horizon = random.uniform(0.25, 30)
+            st.session_state.horizon = random.uniform(VALIDATION['min_horizon'], VALIDATION['max_horizon'])
             for param in ASSET_PRESETS[asset_type]['betas']:
                 st.session_state[f"beta_{param}"] = random.uniform(
                     PARAMETER_BOUNDS[f"beta_{param}"][0],
                     PARAMETER_BOUNDS[f"beta_{param}"][1]
                 )
             st.session_state.seed = random.randint(0, 1000000)
-            st.session_state.tdf = random.uniform(2.5, 30)
+            st.session_state.tdf = random.uniform(VALIDATION['min_tdf'], 30)
             st.session_state.corr_vix_infl = random.uniform(-1, 1)
             st.session_state.corr_real_vix = random.uniform(-1, 1)
             st.session_state.corr_credit_vix = random.uniform(-1, 1)
@@ -173,11 +167,11 @@ def main():
     # Validate historical returns
     try:
         historical_data = parse_returns(hist_returns)
-        if len(historical_data) < 2 and mode == "Genetic Algorithm":
-            st.error("Genetic Algorithm requires at least 2 historical returns")
+        if len(historical_data) < VALIDATION['min_returns'] and mode == "Genetic Algorithm":
+            st.error(f"Genetic Algorithm requires at least {VALIDATION['min_returns']} historical returns")
             return
-    except ValueError:
-        st.error("Invalid historical returns format. Please enter numbers separated by commas")
+    except ValueError as e:
+        st.error(str(e))
         return
 
     # Prepare inputs
@@ -208,6 +202,13 @@ def main():
         'historical_data': historical_data
     }
 
+    # Validate inputs
+    is_valid, errors = validate_inputs(inputs)
+    if not is_valid:
+        for error in errors:
+            st.error(error)
+        return
+
     # Run simulation
     if run_button:
         with st.spinner("Running simulation..."):
@@ -217,11 +218,8 @@ def main():
                     st.session_state.results = results
                     st.success(f"✅ {iterations} simulations complete!")
                 else:
-                    if len(historical_data) < 2:
-                        st.error("Need at least 2 historical returns for Genetic Algorithm")
-                        return
                     optimizer = GeneticOptimizer(model, historical_data)
-                    results = optimizer.optimize(inputs)
+                    results = optimizer.optimize(inputs, historical_data)
                     st.session_state.results = optimizer.export_results(results)
                     st.success(f"✅ Genetic Algorithm optimization complete! Validation Score: {st.session_state.results['validationScore']:.3f}")
             except Exception as e:
@@ -261,89 +259,32 @@ def main():
         percentiles = results['percentiles'] if mode == "Monte Carlo" else calculate_stats(results['optimizedBetas'])['percentiles']
 
         with results_placeholder.container():
-            fig = px.histogram(
-                results['results'] if mode == "Monte Carlo" else list(results['optimizedBetas'].values()),
-                title="Return Distribution",
-                labels={'value': 'Return (%)'}
-            )
-            fig.add_vline(x=percentiles['p50'], line_dash="dash", annotation_text="Median", line_color="green")
-            fig.add_vline(x=percentiles['p25'], line_dash="dot", annotation_text="25th", line_color="blue")
-            fig.add_vline(x=percentiles['p75'], line_dash="dot", annotation_text="75th", line_color="blue")
-            st.plotly_chart(fig, use_container_width=True)
+            returns_data = results['results'] if mode == "Monte Carlo" else list(results['optimizedBetas'].values())
+            st.plotly_chart(create_histogram_plot(returns_data, percentiles), use_container_width=True)
 
             st.subheader("Key Statistics")
-            col_stats1, col_stats2, col_stats3 = st.columns(3)
-            with col_stats1:
-                st.metric("Mean Return", f"{stats['mean']:.2f}%")
-                st.metric("Volatility", f"{stats['stdDev']:.2f}%")
-            with col_stats2:
-                st.metric("VaR 95%", f"-{risk_metrics['var95']:.2f}%")
-                st.metric("CVaR 95%", f"-{risk_metrics['cvar95']:.2f}%")
-            with col_stats3:
-                st.metric("Sharpe Ratio", f"{risk_metrics['sharpe']:.2f}")
-                st.metric("Max Drawdown", f"{risk_metrics['maxDD']:.1f}%")
-
-            st.subheader("Percentiles")
-            col_p1, col_p2, col_p3 = st.columns(3)
-            with col_p1:
-                st.metric("1st Percentile", f"{percentiles['p01']:.1f}%")
-                st.metric("25th Percentile", f"{percentiles['p25']:.1f}%")
-            with col_p2:
-                st.metric("5th Percentile", f"{percentiles['p05']:.1f}%")
-                st.metric("50th Percentile", f"{percentiles['p50']:.1f}%")
-            with col_p3:
-                st.metric("10th Percentile", f"{percentiles['p10']:.1f}%")
-                st.metric("75th Percentile", f"{percentiles['p75']:.1f}%")
+            summary_table = generate_summary_table(stats, risk_metrics)
+            st.table(summary_table)
 
             if mode == "Genetic Algorithm":
                 st.subheader("Convergence History")
                 st.plotly_chart(create_convergence_plot(results['diagnostics']['fitnessProgress']))
                 st.subheader("Population Diversity")
-                diversity_data = [{'gen': h['generation'], 'diversity': h['diversity']} for h in results['diagnostics']['fitnessProgress']]
-                fig_diversity = go.Figure()
-                fig_diversity.add_trace(go.Scatter(
-                    x=[x['gen'] for x in diversity_data],
-                    y=[x['diversity'] for x in diversity_data],
-                    name="Diversity",
-                    line=dict(color="#ff9900")
-                ))
-                fig_diversity.update_layout(
-                    title="Population Diversity Over Generations",
-                    xaxis_title="Generation",
-                    yaxis_title="Diversity",
-                    template="plotly_white"
-                )
-                st.plotly_chart(fig_diversity, use_container_width=True)
+                st.plotly_chart(create_diversity_plot(results['diagnostics']['fitnessProgress']))
 
     # Display backtest results
     if st.session_state.backtest_results:
         with backtest_placeholder.container():
             st.subheader("Backtest Results")
-            backtest_results = st.session_state.backtest_results
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=backtest_results['years'], y=backtest_results['actuals'], name="Actual", line=dict(color="#28a745")))
-            fig.add_trace(go.Scatter(x=backtest_results['years'], y=backtest_results['predictions'], name="Predicted", line=dict(color="#0b74de")))
-            # Add confidence intervals
-            ci_upper = [p + 1.96 * backtest_results['stats']['rmse'] for p in backtest_results['predictions']]
-            ci_lower = [p - 1.96 * backtest_results['stats']['rmse'] for p in backtest_results['predictions']]
-            fig.add_trace(go.Scatter(
-                x=backtest_results['years'] + backtest_results['years'][::-1],
-                y=ci_upper + ci_lower[::-1],
-                fill='toself',
-                fillcolor='rgba(0,100,255,0.2)',
-                line=dict(color='rgba(255,255,255,0)'),
-                name="95% CI"
-            ))
-            fig.update_layout(title="Backtest: Actual vs Predicted Returns", xaxis_title="Period", yaxis_title="Return (%)")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(create_backtest_plot(st.session_state.backtest_results), use_container_width=True)
 
             col_backtest1, col_backtest2 = st.columns(2)
             with col_backtest1:
-                st.metric("MAE", f"{backtest_results['stats']['mae']:.2f}%")
-                st.metric("RMSE", f"{backtest_results['stats']['rmse']:.2f}%")
+                st.metric("MAE", f"{st.session_state.backtest_results['stats']['mae']:.2f}%")
+                st.metric("RMSE", f"{st.session_state.backtest_results['stats']['rmse']:.2f}%")
             with col_backtest2:
-                st.metric("R²", f"{backtest_results['stats']['r2']:.3f}")
-                st.metric("Hit Rate", f"{backtest_results['stats']['hitRate']*100:.1f}%")
+                st.metric("R²", f"{st.session_state.backtest_results['stats']['r2']:.3f}")
+                st.metric("Hit Rate", f"{st.session_state.backtest_results['stats']['hitRate']*100:.1f}%")
 
     # Display sensitivity analysis
     if st.session_state.sensitivity_results:
@@ -356,19 +297,8 @@ def main():
         results = st.session_state.results
         stats = results['stats'] if mode == "Monte Carlo" else calculate_stats(results['optimizedBetas'])
         risk_metrics = results['riskMetrics'] if mode == "Monte Carlo" else calculate_stats(results['optimizedBetas'])['riskMetrics']
-        percentiles = results['percentiles'] if mode == "Monte Carlo" else calculate_stats(results['optimizedBetas'])['percentiles']
-        df = pd.DataFrame({
-            'Metric': ['Mean Return', 'Volatility', 'VaR 95%', 'CVaR 95%', 'Sharpe Ratio', 'Max Drawdown'],
-            'Value': [
-                f"{stats['mean']:.2f}%",
-                f"{stats['stdDev']:.2f}%",
-                f"-{risk_metrics['var95']:.2f}%",
-                f"-{risk_metrics['cvar95']:.2f}%",
-                f"{risk_metrics['sharpe']:.2f}",
-                f"{risk_metrics['maxDD']:.1f}%"
-            ]
-        })
-        csv = df.to_csv(index=False)
+        summary_table = generate_summary_table(stats, risk_metrics)
+        csv = summary_table.to_csv(index=False)
         st.download_button(
             label="Download CSV",
             data=csv,
