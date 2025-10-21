@@ -1,6 +1,7 @@
 import numpy as np
 from scipy.stats import t, norm
 from typing import Dict, List
+import streamlit as st
 
 class ProfessionalMCModel:
     def __init__(self):
@@ -12,7 +13,11 @@ class ProfessionalMCModel:
             'custom': {'name': 'Custom Asset', 'mean': 8.0, 'sigma': 15.0, 'betas': {'real':-0.30, 'expReal':-0.20, 'infl':0.10, 'vix':0.20, 'dxy':-0.01, 'credit':-0.06, 'term':0.04}, 'meanReversion': 0.15}
         }
 
+    @st.cache_data
     def run(self, inputs: Dict) -> Dict:
+        if inputs['enableGarch'] and inputs['garchAlpha'] + inputs['garchBeta'] >= 1:
+            raise ValueError("GARCH parameters (alpha + beta) must be < 1 for stability")
+        
         np.random.seed(inputs['seed'] if inputs['seed'] is not None else None)
         
         # Handle null values
@@ -25,6 +30,11 @@ class ProfessionalMCModel:
             'creditSpread': inputs['creditSpread'] if inputs['creditSpread'] is not None else 100.0,
             'termSpread': inputs['termSpread'] if inputs['termSpread'] is not None else 0
         }
+
+        # Validate extreme values
+        for key, value in macro_factors.items():
+            if value is not None and abs(value) > 1000:
+                st.warning(f"Extreme value detected for {key}: {value}. Consider adjusting.")
 
         # Adjust mean based on macro factors
         mu = inputs['baseMu'] if inputs['baseMu'] is not None else 8.0
@@ -92,7 +102,10 @@ class ProfessionalMCModel:
 
     def _simulate_simple(self, mu, sigma, horizon, mean_reversion, last_return, dist_type, tdf):
         returns = [last_return]
-        for _ in range(int(horizon * 252)):  # Assuming daily returns
+        steps = int(horizon * 252)  # Assuming daily returns
+        if steps < 1:
+            raise ValueError("Simulation horizon too short for selected period unit")
+        for _ in range(steps):
             if dist_type == 't':
                 noise = t.rvs(df=tdf, size=1) * sigma / np.sqrt(tdf / (tdf - 2))
             elif dist_type == 'skewt':
@@ -106,7 +119,10 @@ class ProfessionalMCModel:
     def _simulate_garch(self, mu, sigma, horizon, omega, alpha, beta, mean_reversion, last_return, dist_type, tdf):
         returns = [last_return]
         vol = sigma
-        for _ in range(int(horizon * 252)):
+        steps = int(horizon * 252)
+        if steps < 1:
+            raise ValueError("Simulation horizon too short for selected period unit")
+        for _ in range(steps):
             if dist_type == 't':
                 noise = t.rvs(df=tdf, size=1) * vol / np.sqrt(tdf / (tdf - 2))
             elif dist_type == 'skewt':
@@ -124,15 +140,18 @@ class ProfessionalMCModel:
         drawdowns = (peak - wealth) / peak
         return np.max(drawdowns) * 100
 
+    @st.cache_data
     def backtest(self, inputs: Dict) -> Dict:
         historical_data = inputs.get('historical_data', [])
         if not historical_data:
             historical_data = [10.3, -5.2, 18.7, 6.1, 12.2, 4.0, -8.1, 22.4, 9.9, 3.6, 15.2, -2.8, 11.5, 7.3, 13.8]
+        if len(historical_data) < 2:
+            raise ValueError("Backtesting requires at least 2 historical returns")
         
         predictions = []
         for i in range(len(historical_data)):
             temp_inputs = inputs.copy()
-            temp_inputs['horizon'] = 1
+            temp_inputs['horizon'] = inputs['horizon']
             temp_inputs['iters'] = 1000
             result = self.run(temp_inputs)
             predictions.append(result['stats']['mean'])
@@ -151,6 +170,26 @@ class ProfessionalMCModel:
                 'hitRate': np.mean(np.sign(predictions) == np.sign(actuals))
             }
         }
+
+    @st.cache_data
+    def run_sensitivity_analysis(self, inputs: Dict) -> Dict:
+        factors = ['vix', 'inflExp']
+        ranges = {
+            'vix': np.linspace(5, 50, 10),
+            'inflExp': np.linspace(0, 5, 10)
+        }
+        results = {'factor': [], 'value': [], 'mean_return': []}
+        
+        for factor in factors:
+            base_inputs = inputs.copy()
+            for value in ranges[factor]:
+                base_inputs[factor] = value
+                sim_result = self.run(base_inputs)
+                results['factor'].append(factor)
+                results['value'].append(value)
+                results['mean_return'].append(sim_result['stats']['mean'])
+        
+        return results
 
     def fetch_live_macros(self):
         # Placeholder for live data fetching
