@@ -54,46 +54,46 @@ def _simulate_path(args: tuple) -> float:
         return x / np.sqrt(df / (df - 2.0))
 
     for i in range(steps):
-        # ----- Draw shock -----
+        # Draw shock
         if dist_type == "t":
             eps = draw_standardized_t(tdf)
         elif dist_type == "skewt":
-            eps = draw_standardized_t(tdf) * (1 + skew * np.random.normal(0.0, 0.5))
+            eps = draw_standardized_t(tdf) * (1 + np.clip(skew * np.random.normal(0.0, 0.3), -0.5, 0.5))
         else:
             eps = np.random.normal(0.0, 1.0)
 
         vol_annual = np.sqrt(var_t)
         vol_step = vol_annual * np.sqrt(dt)
 
-        # OU mean reversion on instantaneous annualized rate
-        dr = theta * (mu_dec - r_t) * dt + vol_annual * eps * np.sqrt(dt)
+        # OU mean reversion
+        dr = theta * (mu_dec - r_t) * dt + vol_step * eps
         r_t = r_t + dr
-        r_t = np.clip(r_t, -1.0, 1.0)  # Prevent extreme drifts
+        r_t = np.clip(r_t, -0.5, 0.5)  # Tighter clipping
 
         # Compound wealth geometrically
         inc_log = r_t * dt
-        inc_log = np.clip(inc_log, -0.5, 0.5)
+        inc_log = np.clip(inc_log, -0.3, 0.3)  # Tighter clipping for stability
         wealth *= np.exp(inc_log)
 
         # GARCH update
         if enable_garch:
-            eps2 = (eps * vol_annual)**2  # Scale shock by current volatility
-            var_next = garch_omega + garch_alpha * eps2 + garch_beta * var_t
+            eps2 = eps**2  # Use standardized shock
+            var_next = garch_omega + garch_alpha * eps2 * var_t + garch_beta * var_t
             var_t = np.clip(
                 var_next,
                 MC_DEFAULTS.get("min_vol", 1e-6)**2,
-                MC_DEFAULTS.get("max_vol", 1.0)**2  # Tighter max variance
+                MC_DEFAULTS.get("max_vol", 0.5)**2  # Tighter max variance
             )
 
         # Debug extreme values
-        if i % 100 == 0 and (wealth > 1000 or wealth < 0.01):
+        if i % 100 == 0 and (wealth > 100 or wealth < 0.01):
             logger.debug(f"Step {i}: wealth={wealth:.4f}, r_t={r_t*100:.2f}%, vol_annual={vol_annual*100:.2f}%")
 
     final_return = (wealth - 1.0) * 100.0
     if not np.isfinite(final_return):
         logger.warning(f"Non-finite return detected; setting to -1000%")
         final_return = -1000.0
-    return float(np.clip(final_return, -1000.0, 10000.0))
+    return float(np.clip(final_return, -1000.0, 1000.0))  # Tighter return cap
 
 # ============================================================
 # MAIN CLASS
@@ -109,9 +109,6 @@ class ProfessionalMCModel:
         self.n_processes = PERFORMANCE_CONFIG.get("n_processes") or max(1, cpu_count() - 1)
         logger.info(f"Model initialized (multiprocessing={self.use_multiprocessing})")
 
-    # --------------------------------------------------------
-    # Run Simulation
-    # --------------------------------------------------------
     def run(self, inputs: Dict) -> Dict:
         """
         Run Monte Carlo simulation with progress bar
@@ -199,7 +196,7 @@ class ProfessionalMCModel:
             time.sleep(0.05)
 
             logger.info(
-                f"Params: mu={mu:.2f}%, sigma={sigma:.2f}%, horizon={horizon}, iters={iterations}, dist={dist_type}, GARCH={enable_garch}"
+                f"Params: mu={mu:.2f}%, sigma={sigma:.2f}%, horizon={horizon}, iters={iterations}, dist={dist_type}, GARCH={enable_garch}, skew={skew}"
             )
 
             returns = self._run_sequential(
@@ -217,9 +214,6 @@ class ProfessionalMCModel:
             logger.error(f"Simulation failed: {str(e)}")
             raise
 
-    # --------------------------------------------------------
-    # Sequential Simulation
-    # --------------------------------------------------------
     def _run_sequential(
         self, mu, sigma, horizon, mean_reversion, dist_type, tdf,
         enable_garch, garch_omega, garch_alpha, garch_beta, skew,
@@ -239,18 +233,15 @@ class ProfessionalMCModel:
                 )
                 ret = _simulate_path(args)
                 returns.append(ret)
-                if (i + 1) % max(10, iterations // 100) == 0:  # Update every ~1% or 10 iterations
+                if (i + 1) % max(10, iterations // 100) == 0:
                     progress_bar.progress(min(1.0, (i + 1) / iterations))
-                    time.sleep(0.05)  # Allow UI refresh
+                    time.sleep(0.05)
                     logger.debug(f"Iteration {i+1}/{iterations}, return={ret:.2f}%")
         except Exception as e:
             logger.error(f"Sequential simulation failed at iteration {i+1}: {str(e)}")
             raise
         return returns
 
-    # --------------------------------------------------------
-    # Parallel Simulation
-    # --------------------------------------------------------
     def _run_parallel(
         self, mu, sigma, horizon, mean_reversion, dist_type, tdf,
         enable_garch, garch_omega, garch_alpha, garch_beta, skew,
@@ -280,9 +271,6 @@ class ProfessionalMCModel:
             logger.error(f"Parallel simulation failed: {str(e)}")
             raise
 
-    # --------------------------------------------------------
-    # Backtest
-    # --------------------------------------------------------
     def backtest(self, inputs: Dict) -> Dict:
         """
         Walk-forward backtest on historical data
@@ -332,9 +320,6 @@ class ProfessionalMCModel:
             logger.error(f"Backtest failed: {str(e)}")
             raise
 
-    # --------------------------------------------------------
-    # Sensitivity Analysis
-    # --------------------------------------------------------
     def run_sensitivity_analysis(self, inputs: Dict) -> Dict:
         """
         Analyze sensitivity of returns to macro factors
@@ -369,9 +354,6 @@ class ProfessionalMCModel:
             logger.error(f"Sensitivity analysis failed: {str(e)}")
             raise
 
-    # --------------------------------------------------------
-    # Placeholder for Live Macros
-    # --------------------------------------------------------
     def fetch_live_macros(self):
         """
         Placeholder for fetching live macro data
