@@ -2,6 +2,7 @@ import numpy as np
 from scipy.stats import t, norm
 from typing import Dict, List
 import streamlit as st
+from utils import validate_inputs, calculate_stats
 
 class ProfessionalMCModel:
     def __init__(self):
@@ -15,8 +16,10 @@ class ProfessionalMCModel:
 
     @st.cache_data
     def run(self, inputs: Dict) -> Dict:
-        if inputs['enableGarch'] and inputs['garchAlpha'] + inputs['garchBeta'] >= 1:
-            raise ValueError("GARCH parameters (alpha + beta) must be < 1 for stability")
+        # Validate inputs
+        is_valid, errors = validate_inputs(inputs)
+        if not is_valid:
+            raise ValueError("\n".join(errors))
         
         np.random.seed(inputs['seed'] if inputs['seed'] is not None else None)
         
@@ -37,14 +40,14 @@ class ProfessionalMCModel:
                 st.warning(f"Extreme value detected for {key}: {value}. Consider adjusting.")
 
         # Adjust mean based on macro factors
-        mu = inputs['baseMu'] if inputs['baseMu'] is not None else 8.0
+        mu = inputs['baseMu']
         mu += sum(
             inputs['betas'][k] * v for k, v in macro_factors.items()
             if k in inputs['betas'] and v is not None
         )
 
         # Adjust volatility
-        sigma = inputs['baseSigma'] if inputs['baseSigma'] is not None else 15.0
+        sigma = inputs['baseSigma']
         sigma *= (1 + inputs['betas']['vix'] * (macro_factors['vix'] / 15.0 - 1))
 
         # Generate simulations
@@ -67,38 +70,7 @@ class ProfessionalMCModel:
             last_return = sim_returns[-1]
 
         # Calculate statistics
-        stats = {
-            'mean': np.mean(returns),
-            'stdDev': np.std(returns),
-            'skew': pd.Series(returns).skew(),
-            'kurtosis': pd.Series(returns).kurtosis()
-        }
-
-        # Calculate risk metrics
-        sorted_returns = np.sort(returns)
-        risk_metrics = {
-            'var95': -np.percentile(returns, 5),
-            'cvar95': -np.mean(sorted_returns[:int(0.05 * len(returns))]),
-            'var99': -np.percentile(returns, 1),
-            'cvar99': -np.mean(sorted_returns[:int(0.01 * len(returns))]),
-            'sharpe': stats['mean'] / stats['stdDev'] if stats['stdDev'] > 0 else 0,
-            'sortino': stats['mean'] / np.std([r for r in returns if r < 0]) if len([r for r in returns if r < 0]) > 0 else 0,
-            'maxDD': self._calculate_max_drawdown(returns),
-            'tailRatio': np.abs(np.percentile(returns, 95) / np.percentile(returns, 5)) if np.percentile(returns, 5) != 0 else 1
-        }
-
-        # Calculate percentiles
-        percentiles = {
-            f'p{p}': np.percentile(returns, p)
-            for p in [1, 5, 10, 25, 50, 75, 90, 95, 99]
-        }
-
-        return {
-            'results': returns,
-            'stats': stats,
-            'riskMetrics': risk_metrics,
-            'percentiles': percentiles
-        }
+        return calculate_stats(returns)
 
     def _simulate_simple(self, mu, sigma, horizon, mean_reversion, last_return, dist_type, tdf):
         returns = [last_return]
@@ -133,12 +105,6 @@ class ProfessionalMCModel:
             returns.append(new_return)
             vol = np.sqrt(omega + alpha * noise**2 + beta * vol**2)
         return returns
-
-    def _calculate_max_drawdown(self, returns):
-        wealth = np.cumprod(1 + np.array(returns) / 100)
-        peak = np.maximum.accumulate(wealth)
-        drawdowns = (peak - wealth) / peak
-        return np.max(drawdowns) * 100
 
     @st.cache_data
     def backtest(self, inputs: Dict) -> Dict:
