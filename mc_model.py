@@ -55,13 +55,12 @@ def _simulate_path(args: tuple) -> float:
             eps = np.random.normal(0.0, 1.0)
 
         vol_annual = np.sqrt(var_t)
-        vol_step = vol_annual * np.sqrt(dt) / np.sqrt(252)  # Normalize to daily steps
+        vol_step = vol_annual * np.sqrt(dt)  # Corrected: removed / np.sqrt(252)
 
         dr = theta * (mu_dec - r_t) * dt + vol_step * eps
-        r_t = np.clip(r_t + dr, -0.3, 0.3)
-
+        r_t = r_t + dr  # Removed clipping to allow larger moves
         inc_log = r_t * dt
-        inc_log = np.clip(inc_log, -0.2, 0.2)
+        inc_log = np.clip(inc_log, -0.5, 0.5)  # Widened clip to allow negative returns
         wealth *= np.exp(inc_log)
 
         if enable_garch:
@@ -78,9 +77,9 @@ def _simulate_path(args: tuple) -> float:
 
     final_return = (wealth - 1.0) * 100.0
     if not np.isfinite(final_return):
-        logger.warning(f"Non-finite return detected; setting to -1000%")
-        final_return = -1000.0
-    return float(np.clip(final_return, -1000.0, 500.0))
+        logger.warning(f"Non-finite return detected; setting to -100%")
+        final_return = -100.0
+    return float(np.clip(final_return, -100.0, 500.0))  # Tightened negative clip
 
 class ProfessionalMCModel:
     def __init__(self):
@@ -157,10 +156,7 @@ class ProfessionalMCModel:
                 enable_garch = False
                 garch_omega = garch_alpha = garch_beta = 0
 
-            skew = inputs.get(
-                "skew",
-                0.0 if dist_type == "skewt" else 0.0  # Disable skew by default
-            )
+            skew = inputs.get("skew", 0.0)  # Default to no skew
 
             progress_bar = st.progress(0)
             st.text("Running Monte Carlo simulation...")
