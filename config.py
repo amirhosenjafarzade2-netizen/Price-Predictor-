@@ -1,3 +1,8 @@
+"""
+Configuration module for Monte Carlo Asset Predictor
+Centralizes all configuration parameters
+"""
+
 ASSET_PRESETS = {
     'equity': {
         'name': 'S&P 500',
@@ -91,26 +96,119 @@ UI_CONFIG = {
     'chart_height': 400,
     'max_iterations': 100000,
     'min_iterations': 1000,
-    'default_iterations': 10000
+    'default_iterations': 10000,
+    'results_per_page': 20
 }
 
 VALIDATION = {
     'min_horizon': 0.25,
     'max_horizon': 30.0,
     'min_returns': 2,
-    'min_returns_ga': 5,  # GA needs more data points
+    'min_returns_ga': 5,
     'min_tdf': 2.5,
     'max_tdf': 30.0,
     'min_sigma': 0.01,
-    'max_sigma': 200.0
+    'max_sigma': 200.0,
+    'warning_sigma': 100.0  # Warn if sigma exceeds this
 }
 
-# Fitness function weights for GA
+# Genetic Algorithm Configuration
 GA_CONFIG = {
     'weight_mean_error': 0.4,
     'weight_std_error': 0.3,
     'weight_sharpe': 0.2,
     'weight_regularization': 0.1,
     'convergence_threshold': 0.001,
-    'convergence_window': 10
+    'convergence_window': 10,
+    'default_generations': 50,
+    'default_population': 100,
+    'elite_ratio': 0.2,
+    'mutation_rate': 0.15,
+    'mutation_strength': 0.1,
+    'validation_split': 0.3,
+    'tournament_size': 5,
+    'crossover_probability': 0.8,
+    'fitness_iterations': 500  # Iterations per fitness evaluation (reduced for speed)
+}
+
+# Performance Configuration
+PERFORMANCE_CONFIG = {
+    'enable_multiprocessing': True,
+    'n_processes': None,  # None = auto-detect (cpu_count - 1)
+    'enable_caching': True,
+    'cache_max_size': 1000,
+    'batch_size': 100  # For parallel processing
+}
+
+# Logging Configuration
+LOGGING_CONFIG = {
+    'level': 'INFO',
+    'format': '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    'log_to_file': True,
+    'log_dir': 'logs',
+    'max_bytes': 10485760,  # 10MB
+    'backup_count': 5
+}
+
+# Database Configuration
+DATABASE_CONFIG = {
+    'enabled': False,  # Set to True to enable result persistence
+    'path': 'data/simulation_results.db',
+    'auto_save': True,
+    'save_full_results': False  # Only save statistics to save space
+}
+
+# Visualization Configuration
+VIZ_CONFIG = {
+    'theme': 'plotly_white',
+    'color_palette': {
+        'primary': '#0b74de',
+        'secondary': '#28a745',
+        'warning': '#ff9900',
+        'danger': '#dc3545',
+        'success': '#28a745'
+    },
+    'show_kde': True,  # Show kernel density estimate on histograms
+    'show_confidence_intervals': True,
+    'animation_duration': 500
+}
+
+# Period multipliers for time conversion
+PERIOD_MULTIPLIERS = {
+    'Day': 1/252,
+    'Week': 1/52,
+    'Month': 1/12,
+    '3 Months': 1/4,
+    '4 Months': 1/3,
+    'Quarter': 1/4,
+    'Year': 1
+}
+
+# Distribution types and their parameters
+DISTRIBUTION_CONFIG = {
+    'normal': {
+        'name': 'Normal (Gaussian)',
+        'parameters': []
+    },
+    't': {
+        'name': 'Student-t',
+        'parameters': ['tdf'],
+        'default_tdf': 5.0
+    },
+    'skewt': {
+        'name': 'Skewed Student-t',
+        'parameters': ['tdf', 'skew'],
+        'default_tdf': 5.0,
+        'default_skew': 0.2
+    }
+}
+
+# Risk-free rate assumptions for Sharpe calculation
+RISK_FREE_RATE = 2.0  # 2% annual
+
+# Monte Carlo simulation defaults
+MC_DEFAULTS = {
+    'steps_per_year': 252,  # Trading days
+    'min_vol': 0.0001,  # Minimum volatility to prevent numerical issues
+    'max_vol': 3.0,  # Maximum annualized volatility (300%)
 }
