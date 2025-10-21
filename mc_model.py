@@ -9,7 +9,7 @@ from typing import Dict, List, Optional
 from utils import validate_inputs, calculate_stats
 from config import PERFORMANCE_CONFIG, MC_DEFAULTS, DISTRIBUTION_CONFIG, VALIDATION
 import logging
-from multiprocessing import Pool, cpu_count
+from multiprocessing import Pool, cpu_count, Manager
 import streamlit as st
 
 logger = logging.getLogger(__name__)
@@ -20,7 +20,7 @@ def _simulate_path(args: tuple) -> float:
     Must be at module level for multiprocessing
     """
     (mu, sigma, horizon, mean_reversion, dist_type, tdf,
-     enable_garch, garch_omega, garch_alpha, garch_beta, skew, seed_offset) = args
+     enable_garch, garch_omega, garch_alpha, garch_beta, skew, seed_offset, counter, total_iterations) = args
     
     # Set unique seed for this simulation
     if seed_offset is not None:
@@ -30,71 +30,88 @@ def _simulate_path(args: tuple) -> float:
     dt = horizon / steps
     wealth = 1.0  # Start with initial wealth of 1 for compound return calculation
     
-    mu_dec = mu / 100.0
-    sigma_dec = sigma / 100.0
+    mu_dec = mu / 100.0  # Convert percentage to decimal
+    sigma_dec = sigma / 100.0  # Convert percentage to decimal
     theta = mean_reversion  # Annual reversion speed
     
     current_r = mu  # Start with annualized return rate at mean (%)
     
     if enable_garch:
         vol_dec = sigma_dec
-        for _ in range(steps):
+        for i in range(steps):
             vol_dt_dec = vol_dec * np.sqrt(dt)
             
             # Generate shock
             if dist_type == 't':
-                standardized_shock = t.rvs(df=tdf) / np.sqrt(tdf / (tdf - 2))
+                standardized_shock = t.rvs(df=tdf) / np.sqrt(tdf / (tdf - 2)) if tdf > 2 else np.random.normal(0, 1)
             elif dist_type == 'skewt':
-                base = t.rvs(df=tdf) / np.sqrt(tdf / (tdf - 2))
+                base = t.rvs(df=tdf) / np.sqrt(tdf / (tdf - 2)) if tdf > 2 else np.random.normal(0, 1)
                 standardized_shock = base * (1 + skew * np.random.randn())
             else:
                 standardized_shock = np.random.normal(0, 1)
             
             shock_dec = standardized_shock * vol_dt_dec
             
-            # Update annualized return rate with mean reversion (always include drift)
+            # Update annualized return rate with mean reversion
             drift_dec = mu_dec * dt
-            reversion_dec = theta * dt * (mu_dec - current_r / 100.0)  # Revert to mu_dec
+            reversion_dec = theta * dt * (mu_dec - current_r / 100.0)
             current_r_dec = current_r / 100.0 + drift_dec + reversion_dec + shock_dec
             current_r = current_r_dec * 100.0  # Back to %
             
-            # Incremental return
-            inc_return_dec = current_r_dec * dt  # Daily contribution
+            # Incremental return (properly scaled for time step)
+            inc_return_dec = current_r_dec * dt
             
-            # Compound wealth
-            wealth *= (1 + inc_return_dec)
+            # Compound wealth with clipping to prevent numerical instability
+            wealth *= (1 + np.clip(inc_return_dec, -0.5, 0.5))
             
             # Update volatility (GARCH)
             epsilon_squared = (shock_dec / np.sqrt(dt)) ** 2
             vol_squared_dec = garch_omega + garch_alpha * epsilon_squared + garch_beta * (vol_dec ** 2)
             vol_dec = np.sqrt(np.clip(vol_squared_dec, MC_DEFAULTS['min_vol'], MC_DEFAULTS['max_vol']))
+            
+            # Debug logging for extreme values
+            if i % 100 == 0 and (wealth > 1000 or wealth < 0.01):
+                logger.debug(f"Step {i}: wealth={wealth:.4f}, current_r={current_r:.2f}%, vol_dec={vol_dec*100:.2f}%")
+    
     else:
-        for _ in range(steps):
+        for i in range(steps):
             vol_dt_dec = sigma_dec * np.sqrt(dt)
             
             # Generate shock
             if dist_type == 't':
-                shock_dec = t.rvs(df=tdf) * vol_dt_dec / np.sqrt(tdf / (tdf - 2))
+                shock_dec = t.rvs(df=tdf) * vol_dt_dec / np.sqrt(tdf / (tdf - 2)) if tdf > 2 else np.random.normal(0, vol_dt_dec)
             elif dist_type == 'skewt':
-                base_shock = t.rvs(df=tdf) * vol_dt_dec / np.sqrt(tdf / (tdf - 2))
+                base_shock = t.rvs(df=tdf) * vol_dt_dec / np.sqrt(tdf / (tdf - 2)) if tdf > 2 else np.random.normal(0, vol_dt_dec)
                 shock_dec = base_shock * (1 + skew * np.random.randn())
             else:
                 shock_dec = np.random.normal(0, vol_dt_dec)
             
-            # Update annualized return rate with mean reversion (always include drift)
+            # Update annualized return rate with mean reversion
             drift_dec = mu_dec * dt
-            reversion_dec = theta * dt * (mu_dec - current_r / 100.0)  # Revert to mu_dec
+            reversion_dec = theta * dt * (mu_dec - current_r / 100.0)
             current_r_dec = current_r / 100.0 + drift_dec + reversion_dec + shock_dec
             current_r = current_r_dec * 100.0  # Back to %
             
-            # Incremental return
-            inc_return_dec = current_r_dec * dt  # Daily contribution
+            # Incremental return (properly scaled for time step)
+            inc_return_dec = current_r_dec * dt
             
-            # Compound wealth
-            wealth *= (1 + inc_return_dec)
+            # Compound wealth with clipping to prevent numerical instability
+            wealth *= (1 + np.clip(inc_return_dec, -0.5, 0.5))
+            
+            # Debug logging for extreme values
+            if i % 100 == 0 and (wealth > 1000 or wealth < 0.01):
+                logger.debug(f"Step {i}: wealth={wealth:.4f}, current_r={current_r:.2f}%, vol_dec={sigma_dec*100:.2f}%")
+    
+    # Increment shared counter for progress tracking in parallel mode
+    if counter is not None:
+        with counter.get_lock():
+            counter.value += 1
     
     # Return cumulative compound return as percentage
-    return (wealth - 1.0) * 100.0
+    final_return = (wealth - 1.0) * 100.0
+    if abs(final_return) > 10000:
+        logger.warning(f"Extreme return detected: {final_return:.2f}%")
+    return np.clip(final_return, -1000, 10000)  # Cap extreme returns
 
 class ProfessionalMCModel:
     """
@@ -131,7 +148,7 @@ class ProfessionalMCModel:
 
     def run(self, inputs: Dict) -> Dict:
         """
-        Run Monte Carlo simulation
+        Run Monte Carlo simulation with progress bar
         
         Args:
             inputs: Dictionary with all simulation parameters
@@ -144,6 +161,13 @@ class ProfessionalMCModel:
         if not is_valid:
             error_msgs = [e.message for e in errors if e.severity == 'error']
             raise ValueError("Validation failed:\n" + "\n".join(error_msgs))
+        
+        # Additional validation for distribution parameters
+        dist_type = inputs.get('distType', 'normal')
+        tdf = inputs.get('tdf', DISTRIBUTION_CONFIG[dist_type]['default_tdf'] if dist_type in ['t', 'skewt'] else 5.0)
+        if dist_type in ['t', 'skewt'] and (tdf < 2.1 or tdf > 30):
+            logger.warning(f"Invalid tdf={tdf}, resetting to 5.0")
+            tdf = 5.0
         
         # Set random seed for reproducibility
         seed = inputs.get('seed')
@@ -200,20 +224,36 @@ class ProfessionalMCModel:
         skew = inputs.get('skew', DISTRIBUTION_CONFIG[dist_type].get('default_skew', 0.2) if dist_type == 'skewt' else 0.0)
         enable_garch = inputs.get('enableGarch', False)
         
+        # Validate GARCH parameters
+        garch_omega = inputs.get('garchOmega', 0.0001) if enable_garch else 0
+        garch_alpha = inputs.get('garchAlpha', 0.08) if enable_garch else 0
+        garch_beta = inputs.get('garchBeta', 0.90) if enable_garch else 0
+        if enable_garch and (garch_alpha + garch_beta >= 1.0):
+            logger.warning(f"Unstable GARCH parameters (alpha+beta={garch_alpha+garch_beta}); disabling GARCH")
+            enable_garch = False
+            garch_omega = garch_alpha = garch_beta = 0
+        
+        # Initialize progress bar
+        progress_bar = st.progress(0)
+        st.text("Running Monte Carlo simulation...")
+
         # Run simulations
         if self.use_multiprocessing and iterations >= PERFORMANCE_CONFIG['batch_size']:
             returns = self._run_parallel(mu, sigma, horizon, mean_reversion, dist_type, tdf,
-                                      enable_garch, inputs, iterations, seed)
+                                      enable_garch, inputs, iterations, seed, progress_bar)
         else:
             returns = self._run_sequential(mu, sigma, horizon, mean_reversion, dist_type, tdf,
-                                         enable_garch, inputs, iterations, seed)
+                                         enable_garch, inputs, iterations, seed, progress_bar)
+        
+        # Complete progress bar
+        progress_bar.progress(1.0)
         
         # Calculate statistics
         return calculate_stats(returns)
 
     def _run_sequential(self, mu, sigma, horizon, mean_reversion, dist_type, tdf,
-                       enable_garch, inputs, iterations, base_seed) -> List[float]:
-        """Run simulations sequentially"""
+                       enable_garch, inputs, iterations, base_seed, progress_bar) -> List[float]:
+        """Run simulations sequentially with progress bar"""
         logger.info(f"Running sequential simulation with {iterations} iterations")
         
         returns = []
@@ -222,12 +262,12 @@ class ProfessionalMCModel:
         garch_beta = inputs.get('garchBeta', 0.90) if enable_garch else 0
         skew = inputs.get('skew', DISTRIBUTION_CONFIG[dist_type].get('default_skew', 0.2) if dist_type == 'skewt' else 0.0)
         
-        progress_bar = st.progress(0)
         for i in range(iterations):
             args = (
                 mu, sigma, horizon, mean_reversion, dist_type, tdf,
                 enable_garch, garch_omega, garch_alpha, garch_beta, skew,
-                (base_seed + i) if base_seed is not None else None
+                (base_seed + i) if base_seed is not None else None,
+                None, None  # No counter for sequential mode
             )
             returns.append(_simulate_path(args))
             progress_bar.progress((i + 1) / iterations)
@@ -235,8 +275,8 @@ class ProfessionalMCModel:
         return returns
 
     def _run_parallel(self, mu, sigma, horizon, mean_reversion, dist_type, tdf,
-                     enable_garch, inputs, iterations, base_seed) -> List[float]:
-        """Run simulations in parallel using multiprocessing"""
+                     enable_garch, inputs, iterations, base_seed, progress_bar) -> List[float]:
+        """Run simulations in parallel using multiprocessing with progress bar"""
         logger.info(f"Running parallel simulation with {self.n_processes} processes")
         
         garch_omega = inputs.get('garchOmega', 0.0001) if enable_garch else 0
@@ -244,15 +284,21 @@ class ProfessionalMCModel:
         garch_beta = inputs.get('garchBeta', 0.90) if enable_garch else 0
         skew = inputs.get('skew', DISTRIBUTION_CONFIG[dist_type].get('default_skew', 0.2) if dist_type == 'skewt' else 0.0)
         
+        # Initialize shared counter for progress tracking
+        manager = Manager()
+        counter = manager.Value('i', 0)
+        
         args_list = [
             (
                 mu, sigma, horizon, mean_reversion, dist_type, tdf,
                 enable_garch, garch_omega, garch_alpha, garch_beta, skew,
-                (base_seed + i) if base_seed is not None else None
+                (base_seed + i) if base_seed is not None else None,
+                counter, iterations
             )
             for i in range(iterations)
         ]
         
+        # Run in parallel
         with Pool(processes=self.n_processes) as pool:
             returns = pool.map(_simulate_path, args_list)
         
