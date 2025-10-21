@@ -19,25 +19,12 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ValidationError:
-    """Custom exception for validation errors with suggestions"""
     field: str
     message: str
     suggested_value: Optional[Union[float, int, str]] = None
-    severity: str = 'error'  # 'error', 'warning', 'info'
+    severity: str = 'error'
 
 def parse_returns(text: str) -> List[float]:
-    """
-    Parse comma or newline separated returns from text input
-    
-    Args:
-        text: String containing returns separated by commas or newlines
-        
-    Returns:
-        List of float returns
-        
-    Raises:
-        ValueError: If no valid returns found
-    """
     if not text or not text.strip():
         raise ValueError("No returns data provided")
     
@@ -59,7 +46,6 @@ def parse_returns(text: str) -> List[float]:
         
         logger.info(f"Parsed {len(returns)} historical returns")
         return returns
-        
     except (ValueError, TypeError) as e:
         if "could not convert" in str(e):
             raise ValueError(
@@ -68,9 +54,6 @@ def parse_returns(text: str) -> List[float]:
         raise
 
 def calculate_stats(returns: Union[List[float], np.ndarray, Dict]) -> Dict:
-    """
-    Calculate statistics and risk metrics for cumulative returns
-    """
     if isinstance(returns, dict):
         returns = list(returns.values())
     
@@ -83,7 +66,6 @@ def calculate_stats(returns: Union[List[float], np.ndarray, Dict]) -> Dict:
     if len(returns) == 0:
         raise ValueError("No valid returns after filtering")
     
-    # Log extreme returns for debugging
     if np.max(np.abs(returns)) > 1000:
         logger.warning(f"Extreme returns detected: min={np.min(returns):.2f}%, max={np.max(returns):.2f}%")
     
@@ -94,7 +76,7 @@ def calculate_stats(returns: Union[List[float], np.ndarray, Dict]) -> Dict:
         'median': float(np.median(returns)),
         'stdDev': float(np.std(returns, ddof=1)),
         'skew': float(pd.Series(returns).skew()) if len(returns) > 2 else 0.0,
-        'kurtosis': float(pd.Series(returns).kurtosis()) if len(returns) > 3 else 0.0,
+        'kurtosis': float(pd.Series(returns).kurtosis() + 3.0) if len(returns) > 3 else 3.0,  # Raw kurtosis
         'pPos': float(np.mean(returns > 0) * 100),
         'min': float(np.min(returns)),
         'max': float(np.max(returns)),
@@ -105,13 +87,11 @@ def calculate_stats(returns: Union[List[float], np.ndarray, Dict]) -> Dict:
     var_95_idx = max(1, int(0.05 * len(sorted_returns)))
     var_99_idx = max(1, int(0.01 * len(sorted_returns)))
     
-    # VaR/CVaR as losses (negative returns)
-    var_95 = float(np.percentile(returns, 5))  # Lower 5th percentile
+    var_95 = float(np.percentile(returns, 5))
     cvar_95 = float(np.mean(sorted_returns[:var_95_idx]))
-    var_99 = float(np.percentile(returns, 1))  # Lower 1st percentile
+    var_99 = float(np.percentile(returns, 1))
     cvar_99 = float(np.mean(sorted_returns[:var_99_idx]))
     
-    # Log VaR/CVaR for verification
     logger.debug(f"VaR 95%={var_95:.2f}%, CVaR 95%={cvar_95:.2f}%, VaR 99%={var_99:.2f}%, CVaR 99%={cvar_99:.2f}%")
     
     sharpe = (stats['mean'] - RISK_FREE_RATE) / stats['stdDev'] if stats['stdDev'] > 1e-6 else 0.0
@@ -144,9 +124,6 @@ def calculate_stats(returns: Union[List[float], np.ndarray, Dict]) -> Dict:
     }
 
 def calculate_sortino(returns: np.ndarray, target: float = 0) -> float:
-    """
-    Calculate Sortino ratio using cumulative returns
-    """
     excess_returns = returns - target
     downside_returns = excess_returns[excess_returns < 0]
     
@@ -154,37 +131,29 @@ def calculate_sortino(returns: np.ndarray, target: float = 0) -> float:
         return 0.0
     
     downside_dev = np.sqrt(np.mean(downside_returns ** 2))
-    annualized_mean = np.mean(returns)  # Cumulative return
+    annualized_mean = np.mean(returns)
     return annualized_mean / downside_dev if downside_dev > 0 else 0.0
 
 def calculate_calmar(returns: np.ndarray) -> float:
-    """
-    Calculate Calmar ratio using cumulative returns
-    """
     max_dd = calculate_max_drawdown(returns)
     if abs(max_dd) < 1e-6:
         return 0.0
     return np.mean(returns) / max_dd if max_dd > 0 else 0.0
 
 def calculate_max_drawdown(returns: np.ndarray) -> float:
-    """
-    Calculate max drawdown for cumulative returns
-    """
     if len(returns) == 0:
         return 0.0
     
-    # Convert cumulative returns (%) to wealth paths
-    wealth = 1 + np.array(returns) / 100.0  # Returns are cumulative, not per-step
+    wealth = 1 + np.array(returns) / 100.0
     peak = np.maximum.accumulate(wealth)
     drawdowns = (peak - wealth) / peak
     max_dd = np.max(drawdowns) * 100.0
     if max_dd > 100:
         logger.warning(f"Unrealistic max drawdown: {max_dd:.2f}%")
-        max_dd = min(max_dd, 100.0)  # Cap at 100%
+        max_dd = min(max_dd, 100.0)
     return max_dd
 
 def calculate_tail_ratio(returns: np.ndarray) -> float:
-    """Calculate tail ratio (95th percentile / 5th percentile)"""
     p95 = np.percentile(returns, 95)
     p5 = np.percentile(returns, 5)
     
@@ -194,7 +163,6 @@ def calculate_tail_ratio(returns: np.ndarray) -> float:
     return np.abs(p95 / p5)
 
 def calculate_gain_loss_ratio(returns: np.ndarray) -> float:
-    """Calculate gain/loss ratio (average gain / average loss)"""
     gains = returns[returns > 0]
     losses = returns[returns < 0]
     
@@ -214,12 +182,10 @@ def create_histogram_plot(
     percentiles: Dict[str, float],
     title: str = "Return Distribution"
 ) -> go.Figure:
-    """Create interactive histogram with percentile markers and KDE"""
     returns = np.array(returns)
     
     fig = go.Figure()
     
-    # Histogram
     fig.add_trace(go.Histogram(
         x=returns,
         nbinsx=50,
@@ -231,7 +197,6 @@ def create_histogram_plot(
         opacity=0.7
     ))
     
-    # Add KDE overlay if enabled
     if VIZ_CONFIG.get('show_kde', True):
         try:
             from scipy.stats import gaussian_kde
@@ -253,7 +218,6 @@ def create_histogram_plot(
         except ImportError:
             logger.warning("scipy not available, skipping KDE overlay")
     
-    # Add risk zones with shading
     fig.add_vrect(
         x0=min(returns), x1=percentiles['p05'],
         fillcolor=VIZ_CONFIG['color_palette']['danger'],
@@ -281,7 +245,6 @@ def create_histogram_plot(
         annotation=dict(font_size=10)
     )
     
-    # Add percentile lines
     percentile_lines = [
         (percentiles['p50'], 'Median', VIZ_CONFIG['color_palette']['success'], 'dash'),
         (percentiles['p05'], 'VaR 95%', VIZ_CONFIG['color_palette']['danger'], 'dot'),
@@ -312,7 +275,6 @@ def create_histogram_plot(
     return fig
 
 def create_convergence_plot(fitness_progress: List[Dict]) -> go.Figure:
-    """Create GA convergence plot showing training and validation fitness"""
     fig = go.Figure()
     
     generations = [x['generation'] for x in fitness_progress]
@@ -356,7 +318,6 @@ def create_convergence_plot(fitness_progress: List[Dict]) -> go.Figure:
     return fig
 
 def create_diversity_plot(convergence_history: List[Dict]) -> go.Figure:
-    """Create population diversity plot"""
     fig = go.Figure()
     
     generations = [h['generation'] for h in convergence_history]
@@ -382,7 +343,6 @@ def create_diversity_plot(convergence_history: List[Dict]) -> go.Figure:
     return fig
 
 def create_backtest_plot(backtest_results: Dict) -> go.Figure:
-    """Create backtest plot with actual vs predicted returns and confidence intervals"""
     fig = go.Figure()
     
     years = backtest_results['years']
@@ -441,7 +401,6 @@ def create_backtest_plot(backtest_results: Dict) -> go.Figure:
     return fig
 
 def create_sensitivity_plot(sensitivity_results: Dict) -> go.Figure:
-    """Create sensitivity analysis plot"""
     df = pd.DataFrame(sensitivity_results)
     
     fig = px.line(
@@ -469,7 +428,6 @@ def create_sensitivity_plot(sensitivity_results: Dict) -> go.Figure:
     return fig
 
 def format_number(value: float, decimals: int = 2, suffix: str = '') -> str:
-    """Format number with specified decimals and optional suffix"""
     if value is None or np.isnan(value):
         return 'N/A'
     if np.isinf(value):
@@ -477,9 +435,6 @@ def format_number(value: float, decimals: int = 2, suffix: str = '') -> str:
     return f"{value:.{decimals}f}{suffix}"
 
 def validate_inputs(inputs: Dict) -> Tuple[bool, List[ValidationError]]:
-    """
-    Validate all simulation inputs with detailed error messages
-    """
     errors = []
     
     if inputs.get('baseMu') is None:
@@ -600,7 +555,6 @@ def validate_inputs(inputs: Dict) -> Tuple[bool, List[ValidationError]]:
     return len([e for e in errors if e.severity == 'error']) == 0, errors
 
 def generate_summary_table(stats: Dict, risk_metrics: Dict) -> pd.DataFrame:
-    """Generate summary statistics table"""
     return pd.DataFrame({
         'Metric': [
             'Mean Return',
@@ -645,7 +599,6 @@ def generate_summary_table(stats: Dict, risk_metrics: Dict) -> pd.DataFrame:
     })
 
 def setup_logging(log_level: str = 'INFO'):
-    """Setup logging configuration"""
     from config import LOGGING_CONFIG
     import os
     
