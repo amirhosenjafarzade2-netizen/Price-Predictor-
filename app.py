@@ -50,6 +50,17 @@ def display_validation_errors(errors: list):
             st.info(f"💡 Suggested value: {error.suggested_value}")
 
 
+def annualize_returns(returns: list, period_type: str) -> list:
+    """Convert returns from their period type to annual returns"""
+    multiplier = PERIOD_MULTIPLIERS[period_type]
+    # Annualization factor (how many periods in a year)
+    periods_per_year = 1 / multiplier
+    
+    # Convert to annualized returns
+    annualized = [(((1 + r/100) ** periods_per_year) - 1) * 100 for r in returns]
+    return annualized
+
+
 def main():
     st.title("🎯 Professional Monte Carlo Asset Predictor")
     st.caption(
@@ -77,8 +88,11 @@ def main():
             help="Monte Carlo: Direct simulation | GA: Parameter optimization"
         )
         
+        st.markdown("---")
+        st.subheader("📅 Forecast Horizon")
+        
         period_unit = st.selectbox(
-            "Period Unit",
+            "Period Type",
             list(PERIOD_MULTIPLIERS.keys()),
             help="Time unit for forecast horizon"
         )
@@ -130,12 +144,36 @@ def main():
             help="Select a preset or use custom parameters"
         )
         
+        st.markdown("**📊 Historical Returns Data**")
+        
+        # Add period selection for historical data
+        col_hist_period, col_hist_count = st.columns([2, 1])
+        with col_hist_period:
+            hist_period_type = st.selectbox(
+                "Historical Data Period Type",
+                list(PERIOD_MULTIPLIERS.keys()),
+                index=list(PERIOD_MULTIPLIERS.keys()).index("Year"),
+                help="What timeframe do your historical returns represent?"
+            )
+        with col_hist_count:
+            st.metric(
+                "Periods to Year", 
+                f"{1/PERIOD_MULTIPLIERS[hist_period_type]:.0f}x",
+                help=f"There are {1/PERIOD_MULTIPLIERS[hist_period_type]:.0f} {hist_period_type.lower()}s per year"
+            )
+        
         hist_returns = st.text_area(
-            "Historical Returns (%)",
-            placeholder="e.g. 8.2, -3.1, 12.5, 7.8, -1.2, ...",
+            f"Historical Returns (%) - {hist_period_type}ly",
+            placeholder=f"e.g. 8.2, -3.1, 12.5, 7.8, -1.2, ... (one return per {hist_period_type.lower()})",
             value="10.3, -5.2, 18.7, 6.1, 12.2, 4.0, -8.1, 22.4, 9.9, 3.6, 15.2, -2.8, 11.5, 7.3, 13.8",
-            help=f"Enter comma-separated returns (min {VALIDATION['min_returns_ga']} for GA)",
+            help=f"Enter {hist_period_type.lower()}ly returns separated by commas (min {VALIDATION['min_returns_ga']} for GA)",
             height=100
+        )
+        
+        auto_annualize = st.checkbox(
+            f"Auto-annualize {hist_period_type.lower()}ly returns",
+            value=True,
+            help=f"Convert {hist_period_type.lower()}ly returns to annual equivalent for baseline calculations"
         )
 
         col_mean, col_sigma, col_reversion = st.columns(3)
@@ -237,14 +275,13 @@ def main():
                 help="Yield curve slope (10Y - 2Y)"
             )
         with col_horizon:
-            horizon = st.number_input(
-                "Forecast Horizon (years)",
-                min_value=VALIDATION['min_horizon'],
-                max_value=VALIDATION['max_horizon'],
-                step=0.25,
-                value=float(period_count),
-                key="horizon",
-                help="Time horizon for simulation"
+            # Calculate horizon in years
+            horizon_years = period_count * PERIOD_MULTIPLIERS[period_unit]
+            st.metric(
+                "Forecast Horizon",
+                f"{horizon_years:.2f} years",
+                delta=f"{period_count} {period_unit.lower()}(s)",
+                help="Calculated from period settings in sidebar"
             )
 
         # Advanced settings
@@ -398,7 +435,6 @@ def main():
             st.session_state.dxy = random.uniform(70, 150)
             st.session_state.credit_spread = random.uniform(0, 500)
             st.session_state.term_spread = random.uniform(-100, 100)
-            st.session_state.horizon = random.uniform(VALIDATION['min_horizon'], VALIDATION['max_horizon'])
             
             for param in ASSET_PRESETS[asset_type]['betas']:
                 min_val, max_val = PARAMETER_BOUNDS[f"beta_{param}"]
@@ -431,6 +467,26 @@ def main():
     try:
         historical_data = parse_returns(hist_returns)
         
+        # Display info about historical data
+        st.info(
+            f"ℹ️ Loaded {len(historical_data)} {hist_period_type.lower()}ly returns | "
+            f"Mean: {np.mean(historical_data):.2f}% | "
+            f"Std Dev: {np.std(historical_data):.2f}%"
+        )
+        
+        # Annualize if requested
+        if auto_annualize and hist_period_type != "Year":
+            annualized_data = annualize_returns(historical_data, hist_period_type)
+            st.success(
+                f"✅ Auto-annualized: {hist_period_type}ly → Annual | "
+                f"Annual Mean: {np.mean(annualized_data):.2f}% | "
+                f"Annual Std Dev: {np.std(annualized_data):.2f}%"
+            )
+            # Use annualized data for model
+            historical_data_for_model = annualized_data
+        else:
+            historical_data_for_model = historical_data
+        
         # Check minimum requirements for GA
         if mode == "Genetic Algorithm" and len(historical_data) < VALIDATION['min_returns_ga']:
             st.error(
@@ -454,7 +510,7 @@ def main():
         'dxy': dxy,
         'creditSpread': credit_spread,
         'termSpread': term_spread,
-        'horizon': horizon * PERIOD_MULTIPLIERS[period_unit],
+        'horizon': horizon_years,
         'iters': iterations,
         'seed': int(seed) if seed is not None else None,
         'distType': dist_type,
@@ -465,7 +521,7 @@ def main():
         'garchAlpha': garch_alpha,
         'garchBeta': garch_beta,
         'betas': betas,
-        'historical_data': historical_data
+        'historical_data': historical_data_for_model
     }
 
     # Validate inputs
@@ -502,8 +558,8 @@ def main():
                     
                 else:
                     # Genetic Algorithm mode
-                    optimizer = GeneticOptimizer(model, historical_data)
-                    ga_results = optimizer.optimize(inputs, historical_data)
+                    optimizer = GeneticOptimizer(model, historical_data_for_model)
+                    ga_results = optimizer.optimize(inputs, historical_data_for_model)
                     st.session_state.results = optimizer.export_results(ga_results)
                     elapsed = (datetime.now() - start_time).total_seconds()
                     st.session_state.last_run_time = elapsed
@@ -528,7 +584,7 @@ def main():
             try:
                 logger.info("Starting backtest")
                 backtest_inputs = inputs.copy()
-                backtest_inputs['horizon'] = PERIOD_MULTIPLIERS[period_unit]
+                backtest_inputs['horizon'] = PERIOD_MULTIPLIERS[hist_period_type]
                 backtest_inputs['iters'] = 1000
                 backtest_inputs['seed'] = 12345
                 
@@ -653,13 +709,15 @@ def main():
             
             # Add metadata
             metadata = pd.DataFrame({
-                'Parameter': ['Mode', 'Date', 'Iterations', 'Asset Type', 'Horizon'],
+                'Parameter': ['Mode', 'Date', 'Iterations', 'Asset Type', 'Horizon', 'Historical Period Type', 'Historical Data Points'],
                 'Value': [
                     mode,
                     datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                     iterations,
                     ASSET_PRESETS[asset_type]['name'],
-                    f"{horizon} {period_unit}"
+                    f"{horizon_years:.2f} years ({period_count} {period_unit})",
+                    hist_period_type,
+                    len(historical_data)
                 ]
             })
             
