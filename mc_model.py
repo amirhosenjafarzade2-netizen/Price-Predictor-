@@ -7,13 +7,12 @@ import numpy as np
 from scipy.stats import t, norm
 from typing import Dict, List, Optional
 from utils import validate_inputs, calculate_stats
-from config import PERFORMANCE_CONFIG, MC_DEFAULTS
+from config import PERFORMANCE_CONFIG, MC_DEFAULTS, DISTRIBUTION_CONFIG
 import logging
 from multiprocessing import Pool, cpu_count
 import os
 
 logger = logging.getLogger(__name__)
-
 
 def _simulate_path(args: tuple) -> float:
     """
@@ -21,7 +20,7 @@ def _simulate_path(args: tuple) -> float:
     Must be at module level for multiprocessing
     """
     (mu, sigma, horizon, mean_reversion, dist_type, tdf,
-     enable_garch, garch_omega, garch_alpha, garch_beta, seed_offset) = args
+     enable_garch, garch_omega, garch_alpha, garch_beta, skew, seed_offset) = args
     
     # Set unique seed for this simulation
     if seed_offset is not None:
@@ -43,7 +42,7 @@ def _simulate_path(args: tuple) -> float:
                 standardized_shock = t.rvs(df=tdf) / np.sqrt(tdf / (tdf - 2))
             elif dist_type == 'skewt':
                 base = t.rvs(df=tdf) / np.sqrt(tdf / (tdf - 2))
-                standardized_shock = base * (1 + 0.2 * np.random.randn())
+                standardized_shock = base * (1 + skew * np.random.randn())
             else:
                 standardized_shock = np.random.normal(0, 1)
             
@@ -67,7 +66,7 @@ def _simulate_path(args: tuple) -> float:
                 shock = t.rvs(df=tdf) * sigma_dt / np.sqrt(tdf / (tdf - 2))
             elif dist_type == 'skewt':
                 base_shock = t.rvs(df=tdf) * sigma_dt / np.sqrt(tdf / (tdf - 2))
-                shock = base_shock * (1 + 0.2 * np.random.randn())
+                shock = base_shock * (1 + skew * np.random.randn())
             else:
                 shock = np.random.normal(0, sigma_dt)
             
@@ -77,7 +76,6 @@ def _simulate_path(args: tuple) -> float:
     
     # Return cumulative return as percentage
     return sum(returns) * 100
-
 
 class ProfessionalMCModel:
     """
@@ -149,7 +147,7 @@ class ProfessionalMCModel:
         mu = inputs['baseMu']
         betas = inputs.get('betas', {})
         
-        # Map macro factors to beta keys
+        # Robust beta mapping
         beta_mapping = {
             'realRate': 'real',
             'expRealRate': 'expReal',
@@ -160,86 +158,74 @@ class ProfessionalMCModel:
             'termSpread': 'term'
         }
         
-        for macro_key, beta_key in beta_mapping.items():
-            if beta_key in betas and macro_key in macro_factors:
-                mu += betas[beta_key] * macro_factors[macro_key]
+        mu += sum(
+            betas.get(beta_mapping.get(factor, factor), 0) * value
+            for factor, value in macro_factors.items()
+            if beta_mapping.get(factor, factor) in betas and value is not None
+        )
 
-        # Adjust volatility based on VIX
+        # Adjust volatility
         sigma = inputs['baseSigma']
-        if 'vix' in betas and macro_factors['vix'] > 0:
-            vix_adjustment = 1 + betas['vix'] * (macro_factors['vix'] / 15.0 - 1)
-            sigma *= max(0.1, vix_adjustment)
+        if 'vix' in betas:
+            sigma *= (1 + betas['vix'] * (macro_factors['vix'] / 15.0 - 1))
+        sigma = np.clip(sigma, VALIDATION['min_sigma'], VALIDATION['max_sigma'])
 
-        # Prepare simulation parameters
+        # Simulation parameters
         horizon = inputs['horizon']
         iterations = int(inputs['iters'])
         mean_reversion = inputs.get('meanReversion', 0)
         dist_type = inputs.get('distType', 'normal')
-        tdf = inputs.get('tdf', 5)
+        tdf = inputs.get('tdf', DISTRIBUTION_CONFIG[dist_type]['default_tdf'] if dist_type in ['t', 'skewt'] else 5.0)
+        skew = inputs.get('skew', DISTRIBUTION_CONFIG[dist_type].get('default_skew', 0.2) if dist_type == 'skewt' else 0.0)
         enable_garch = inputs.get('enableGarch', False)
         
-        logger.info(
-            f"Starting simulation: {iterations} iterations, "
-            f"horizon={horizon:.2f}y, μ={mu:.2f}%, σ={sigma:.2f}%"
-        )
-
-        # Run simulations (parallel or sequential)
-        if self.use_multiprocessing and iterations >= 1000:
-            returns = self._run_parallel(
-                mu / 100, sigma / 100, horizon, mean_reversion,
-                dist_type, tdf, enable_garch, inputs, iterations, seed
-            )
+        # Run simulations
+        if self.use_multiprocessing and iterations >= PERFORMANCE_CONFIG['batch_size']:
+            returns = self._run_parallel(mu, sigma, horizon, mean_reversion, dist_type, tdf,
+                                      enable_garch, inputs, iterations, seed)
         else:
-            returns = self._run_sequential(
-                mu / 100, sigma / 100, horizon, mean_reversion,
-                dist_type, tdf, enable_garch, inputs, iterations
-            )
-
-        logger.info(f"Simulation complete: mean={np.mean(returns):.2f}%, std={np.std(returns):.2f}%")
-
-        # Calculate and return statistics
+            returns = self._run_sequential(mu, sigma, horizon, mean_reversion, dist_type, tdf,
+                                         enable_garch, inputs, iterations, seed)
+        
+        # Calculate statistics
         return calculate_stats(returns)
 
-    def _run_sequential(
-        self, mu, sigma, horizon, mean_reversion, dist_type, tdf,
-        enable_garch, inputs, iterations
-    ) -> List[float]:
-        """Run simulations sequentially (for small iteration counts)"""
-        returns = []
+    def _run_sequential(self, mu, sigma, horizon, mean_reversion, dist_type, tdf,
+                       enable_garch, inputs, iterations, base_seed) -> List[float]:
+        """Run simulations sequentially"""
+        logger.info(f"Running sequential simulation with {iterations} iterations")
         
-        garch_params = (
-            inputs.get('garchOmega', 0.0001),
-            inputs.get('garchAlpha', 0.08),
-            inputs.get('garchBeta', 0.90)
-        ) if enable_garch else (0, 0, 0)
+        returns = []
+        garch_omega = inputs.get('garchOmega', 0.0001) if enable_garch else 0
+        garch_alpha = inputs.get('garchAlpha', 0.08) if enable_garch else 0
+        garch_beta = inputs.get('garchBeta', 0.90) if enable_garch else 0
+        skew = inputs.get('skew', DISTRIBUTION_CONFIG[dist_type].get('default_skew', 0.2) if dist_type == 'skewt' else 0.0)
         
         for i in range(iterations):
             args = (
                 mu, sigma, horizon, mean_reversion, dist_type, tdf,
-                enable_garch, *garch_params, i
+                enable_garch, garch_omega, garch_alpha, garch_beta, skew,
+                (base_seed + i) if base_seed is not None else None
             )
             returns.append(_simulate_path(args))
         
         return returns
 
-    def _run_parallel(
-        self, mu, sigma, horizon, mean_reversion, dist_type, tdf,
-        enable_garch, inputs, iterations, base_seed
-    ) -> List[float]:
+    def _run_parallel(self, mu, sigma, horizon, mean_reversion, dist_type, tdf,
+                     enable_garch, inputs, iterations, base_seed) -> List[float]:
         """Run simulations in parallel using multiprocessing"""
         logger.info(f"Running parallel simulation with {self.n_processes} processes")
         
-        garch_params = (
-            inputs.get('garchOmega', 0.0001),
-            inputs.get('garchAlpha', 0.08),
-            inputs.get('garchBeta', 0.90)
-        ) if enable_garch else (0, 0, 0)
+        garch_omega = inputs.get('garchOmega', 0.0001) if enable_garch else 0
+        garch_alpha = inputs.get('garchAlpha', 0.08) if enable_garch else 0
+        garch_beta = inputs.get('garchBeta', 0.90) if enable_garch else 0
+        skew = inputs.get('skew', DISTRIBUTION_CONFIG[dist_type].get('default_skew', 0.2) if dist_type == 'skewt' else 0.0)
         
         # Create argument list for each simulation
         args_list = [
             (
                 mu, sigma, horizon, mean_reversion, dist_type, tdf,
-                enable_garch, *garch_params,
+                enable_garch, garch_omega, garch_alpha, garch_beta, skew,
                 (base_seed + i) if base_seed is not None else None
             )
             for i in range(iterations)
@@ -275,7 +261,7 @@ class ProfessionalMCModel:
             # Use historical volatility if we have enough data
             if i > 0:
                 hist_vol = np.std(historical_data[:i+1])
-                temp_inputs['baseSigma'] = max(1.0, hist_vol)
+                temp_inputs['baseSigma'] = max(VALIDATION['min_sigma'], hist_vol)
             
             # Run simulation
             try:
@@ -366,3 +352,11 @@ class ProfessionalMCModel:
         
         logger.info("Sensitivity analysis complete")
         return results
+
+    def fetch_live_macros(self):
+        """
+        Placeholder for fetching live macro data
+        Currently returns empty dict as per user requirement
+        """
+        logger.info("Live macro data fetching disabled")
+        return {}
