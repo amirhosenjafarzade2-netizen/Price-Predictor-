@@ -1,12 +1,19 @@
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+import plotly.express as px
 
 def parse_returns(text: str) -> list:
-    return [float(x) for x in text.replace('\n', ',').split(',') if x.strip() and not np.isnan(float(x))]
+    try:
+        return [float(x) for x in text.replace('\n', ',').split(',') if x.strip() and not np.isnan(float(x))]
+    except ValueError:
+        raise ValueError("Invalid historical returns format. Please enter numbers separated by commas")
 
 def calculate_stats(data: dict) -> dict:
     returns = list(data.values()) if isinstance(data, dict) else data
+    if not returns:
+        raise ValueError("No valid returns data provided for statistics calculation")
+    
     stats = {
         'mean': np.mean(returns),
         'stdDev': np.std(returns),
@@ -44,4 +51,15 @@ def create_convergence_plot(fitness_progress: list) -> go.Figure:
         yaxis_title="Fitness Score",
         template="plotly_white"
     )
+    return fig
+
+def create_sensitivity_plot(sensitivity_data: dict) -> go.Figure:
+    fig = px.line(
+        x=sensitivity_data['value'],
+        y=sensitivity_data['mean_return'],
+        color=sensitivity_data['factor'],
+        title="Sensitivity Analysis: Mean Return vs Macro Factors",
+        labels={'x': 'Factor Value', 'y': 'Mean Return (%)'}
+    )
+    fig.update_layout(template="plotly_white")
     return fig
