@@ -9,15 +9,11 @@ from typing import Dict, List
 from utils import validate_inputs, calculate_stats
 from config import PERFORMANCE_CONFIG, MC_DEFAULTS, DISTRIBUTION_CONFIG, VALIDATION
 import logging
-from multiprocessing import Pool, cpu_count, Manager
+from multiprocessing import Pool, cpu_count
 import streamlit as st
 import time
 
 logger = logging.getLogger(__name__)
-
-# ============================================================
-# FIXED _simulate_path FUNCTION
-# ============================================================
 
 def _simulate_path(args: tuple) -> float:
     """
@@ -30,21 +26,18 @@ def _simulate_path(args: tuple) -> float:
     (mu, sigma, horizon, mean_reversion, dist_type, tdf,
      enable_garch, garch_omega, garch_alpha, garch_beta, skew, seed_offset) = args
 
-    # Per-path RNG seed
     if seed_offset is not None:
         np.random.seed(int(seed_offset))
 
-    # Simulation setup
     steps = max(1, int(horizon * MC_DEFAULTS.get("steps_per_year", 252)))
     dt = float(horizon) / steps
 
     mu_dec = float(mu) / 100.0
     sigma_dec = float(sigma) / 100.0
     theta = float(mean_reversion)
-    r_t = mu_dec  # current annualized return rate (decimal)
+    r_t = mu_dec
     wealth = 1.0
 
-    # GARCH variance (annualized)
     var_t = max(sigma_dec**2, MC_DEFAULTS.get("min_vol", 1e-6)**2)
 
     def draw_standardized_t(df):
@@ -54,65 +47,48 @@ def _simulate_path(args: tuple) -> float:
         return x / np.sqrt(df / (df - 2.0))
 
     for i in range(steps):
-        # Draw shock
         if dist_type == "t":
             eps = draw_standardized_t(tdf)
         elif dist_type == "skewt":
-            eps = draw_standardized_t(tdf) * (1 + np.clip(skew * np.random.normal(0.0, 0.3), -0.5, 0.5))
+            eps = draw_standardized_t(tdf) * (1 + np.clip(skew * np.random.normal(0.0, 0.2), -0.3, 0.3))
         else:
             eps = np.random.normal(0.0, 1.0)
 
         vol_annual = np.sqrt(var_t)
-        vol_step = vol_annual * np.sqrt(dt)
+        vol_step = vol_annual * np.sqrt(dt) / np.sqrt(252)  # Normalize to daily steps
 
-        # OU mean reversion
         dr = theta * (mu_dec - r_t) * dt + vol_step * eps
-        r_t = r_t + dr
-        r_t = np.clip(r_t, -0.5, 0.5)  # Tighter clipping
+        r_t = np.clip(r_t + dr, -0.3, 0.3)
 
-        # Compound wealth geometrically
         inc_log = r_t * dt
-        inc_log = np.clip(inc_log, -0.3, 0.3)  # Tighter clipping for stability
+        inc_log = np.clip(inc_log, -0.2, 0.2)
         wealth *= np.exp(inc_log)
 
-        # GARCH update
         if enable_garch:
-            eps2 = eps**2  # Use standardized shock
+            eps2 = eps**2
             var_next = garch_omega + garch_alpha * eps2 * var_t + garch_beta * var_t
             var_t = np.clip(
                 var_next,
                 MC_DEFAULTS.get("min_vol", 1e-6)**2,
-                MC_DEFAULTS.get("max_vol", 0.5)**2  # Tighter max variance
+                MC_DEFAULTS.get("max_vol", 0.3)**2
             )
 
-        # Debug extreme values
-        if i % 100 == 0 and (wealth > 100 or wealth < 0.01):
+        if i % 100 == 0 and (wealth > 50 or wealth < 0.02):
             logger.debug(f"Step {i}: wealth={wealth:.4f}, r_t={r_t*100:.2f}%, vol_annual={vol_annual*100:.2f}%")
 
     final_return = (wealth - 1.0) * 100.0
     if not np.isfinite(final_return):
         logger.warning(f"Non-finite return detected; setting to -1000%")
         final_return = -1000.0
-    return float(np.clip(final_return, -1000.0, 1000.0))  # Tighter return cap
-
-# ============================================================
-# MAIN CLASS
-# ============================================================
+    return float(np.clip(final_return, -1000.0, 500.0))
 
 class ProfessionalMCModel:
-    """
-    Professional Monte Carlo Asset Return Simulator (fixed)
-    """
-
     def __init__(self):
-        self.use_multiprocessing = False  # Disabled for stability
+        self.use_multiprocessing = False
         self.n_processes = PERFORMANCE_CONFIG.get("n_processes") or max(1, cpu_count() - 1)
         logger.info(f"Model initialized (multiprocessing={self.use_multiprocessing})")
 
     def run(self, inputs: Dict) -> Dict:
-        """
-        Run Monte Carlo simulation with progress bar
-        """
         try:
             logger.info("Starting Monte Carlo simulation")
 
@@ -133,7 +109,6 @@ class ProfessionalMCModel:
                 np.random.seed(int(seed))
                 logger.info(f"Using seed {seed}")
 
-            # Macro factor adjustments
             mu = float(inputs["baseMu"])
             sigma = float(inputs["baseSigma"])
             horizon = float(inputs["horizon"])
@@ -173,7 +148,6 @@ class ProfessionalMCModel:
                 sigma *= (1 + betas["vix"] * vix_factor * macro_weight)
             sigma = np.clip(sigma, VALIDATION["min_sigma"], VALIDATION["max_sigma"])
 
-            # GARCH parameters
             enable_garch = bool(inputs.get("enableGarch", False))
             garch_omega = inputs.get("garchOmega", 0.0001) if enable_garch else 0
             garch_alpha = inputs.get("garchAlpha", 0.08) if enable_garch else 0
@@ -185,12 +159,9 @@ class ProfessionalMCModel:
 
             skew = inputs.get(
                 "skew",
-                DISTRIBUTION_CONFIG.get(dist_type, {}).get("default_skew", 0.2)
-                if dist_type == "skewt"
-                else 0.0,
+                0.0 if dist_type == "skewt" else 0.0  # Disable skew by default
             )
 
-            # Run simulation
             progress_bar = st.progress(0)
             st.text("Running Monte Carlo simulation...")
             time.sleep(0.05)
@@ -209,7 +180,6 @@ class ProfessionalMCModel:
             result = calculate_stats(returns)
             logger.info(f"Results: mean={result['stats']['mean']:.2f}%, std={result['stats']['stdDev']:.2f}%")
             return result
-
         except Exception as e:
             logger.error(f"Simulation failed: {str(e)}")
             raise
@@ -219,9 +189,6 @@ class ProfessionalMCModel:
         enable_garch, garch_omega, garch_alpha, garch_beta, skew,
         iterations, base_seed, progress_bar
     ) -> List[float]:
-        """
-        Run simulations sequentially with frequent progress updates
-        """
         logger.info(f"Running sequential simulation with {iterations} iterations")
         returns = []
         try:
@@ -247,13 +214,7 @@ class ProfessionalMCModel:
         enable_garch, garch_omega, garch_alpha, garch_beta, skew,
         iterations, base_seed
     ) -> List[float]:
-        """
-        Run simulations in parallel with basic progress tracking
-        """
         logger.info(f"Running parallel simulation with {self.n_processes} processes")
-        manager = Manager()
-        counter = manager.Value('i', 0)
-
         args_list = [
             (
                 mu, sigma, horizon, mean_reversion, dist_type, tdf,
@@ -272,9 +233,6 @@ class ProfessionalMCModel:
             raise
 
     def backtest(self, inputs: Dict) -> Dict:
-        """
-        Walk-forward backtest on historical data
-        """
         try:
             historical = inputs.get("historical_data", [])
             if not historical or len(historical) < 2:
@@ -321,9 +279,6 @@ class ProfessionalMCModel:
             raise
 
     def run_sensitivity_analysis(self, inputs: Dict) -> Dict:
-        """
-        Analyze sensitivity of returns to macro factors
-        """
         try:
             logger.info("Running sensitivity analysis")
             factors = ["vix", "inflExp", "realRate", "creditSpread"]
@@ -355,8 +310,5 @@ class ProfessionalMCModel:
             raise
 
     def fetch_live_macros(self):
-        """
-        Placeholder for fetching live macro data
-        """
         logger.info("Live macro fetch disabled")
         return {}
