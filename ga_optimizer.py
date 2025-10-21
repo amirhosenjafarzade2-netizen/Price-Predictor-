@@ -3,6 +3,7 @@ import random
 from typing import Dict, List, Tuple
 from dataclasses import dataclass
 import streamlit as st
+from utils import validate_inputs
 
 @dataclass
 class Individual:
@@ -79,8 +80,8 @@ class GeneticOptimizer:
             
             convergence_history.append({
                 'generation': gen,
-                'best_train_fitness': ranked[0][1],
-                'best_valid_fitness': valid_fitness,
+                'train': ranked[0][1],
+                'valid': valid_fitness,
                 'avg_fitness': np.mean(fitnesses),
                 'diversity': self._calculate_diversity(population)
             })
@@ -139,7 +140,7 @@ class GeneticOptimizer:
             
             mean_error = abs(stats['mean'] - hist_mean) / max(0.1, hist_std)
             std_error = abs(stats['stdDev'] - hist_std) / max(0.1, hist_std)
-            sharpe_score = np.clip(stats['mean'] / stats['stdDev'], 0, 3)
+            sharpe_score = np.clip(stats['sharpe'], 0, 3)
             regularization = self._calculate_regularization(individual)
             
             return -0.4 * mean_error - 0.3 * std_error + 0.2 * sharpe_score - 0.1 * regularization
@@ -172,13 +173,13 @@ class GeneticOptimizer:
         if len(history) < window:
             return False
         recent = history[-window:]
-        fitness_values = [h['best_train_fitness'] for h in recent]
+        fitness_values = [h['train'] for h in recent]
         return (fitness_values[-1] - fitness_values[0]) < 0.001
 
     def _calculate_improvement(self, base_inputs: Dict, best_individual: Individual) -> Dict[str, float]:
         improvement = {}
         base_betas = base_inputs['betas']
-        optimized_betas = best_individual.to_dict()
+        optimized_betas = best_individual.to_doc()
         for param in base_betas.keys():
             improvement[param] = optimized_betas[param] - base_betas[param]
         improvement['mean_reversion'] = best_individual.mean_reversion - base_inputs['meanReversion']
