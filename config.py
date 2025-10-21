@@ -8,15 +8,7 @@ ASSET_PRESETS = {
         'name': 'S&P 500',
         'mean': 9.2,
         'sigma': 16.5,
-        'betas': {
-            'real': -0.35,
-            'expReal': -0.22,
-            'infl': 0.15,
-            'vix': 0.25,
-            'dxy': -0.02,
-            'credit': -0.08,
-            'term': 0.05
-        },
+        'betas': {},  # Set to empty to avoid macro factor bias
         'meanReversion': 0.15
     },
     'bonds': {
@@ -107,12 +99,11 @@ VALIDATION = {
     'min_returns_ga': 5,
     'min_tdf': 2.5,
     'max_tdf': 30.0,
-    'min_sigma': 0.01,
+    'min_sigma': 0.1,  # Increased from 0.01
     'max_sigma': 200.0,
-    'warning_sigma': 100.0  # Warn if sigma exceeds this
+    'warning_sigma': 100.0
 }
 
-# Genetic Algorithm Configuration
 GA_CONFIG = {
     'weight_mean_error': 0.4,
     'weight_std_error': 0.3,
@@ -128,37 +119,33 @@ GA_CONFIG = {
     'validation_split': 0.3,
     'tournament_size': 5,
     'crossover_probability': 0.8,
-    'fitness_iterations': 500  # Iterations per fitness evaluation (reduced for speed)
+    'fitness_iterations': 500
 }
 
-# Performance Configuration
 PERFORMANCE_CONFIG = {
     'enable_multiprocessing': True,
-    'n_processes': None,  # None = auto-detect (cpu_count - 1)
+    'n_processes': None,
     'enable_caching': True,
     'cache_max_size': 1000,
-    'batch_size': 100  # For parallel processing
+    'batch_size': 100
 }
 
-# Logging Configuration
 LOGGING_CONFIG = {
     'level': 'INFO',
     'format': '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     'log_to_file': True,
     'log_dir': 'logs',
-    'max_bytes': 10485760,  # 10MB
+    'max_bytes': 10485760,
     'backup_count': 5
 }
 
-# Database Configuration
 DATABASE_CONFIG = {
-    'enabled': False,  # Set to True to enable result persistence
+    'enabled': False,
     'path': 'data/simulation_results.db',
     'auto_save': True,
-    'save_full_results': False  # Only save statistics to save space
+    'save_full_results': False
 }
 
-# Visualization Configuration
 VIZ_CONFIG = {
     'theme': 'plotly_white',
     'color_palette': {
@@ -168,12 +155,11 @@ VIZ_CONFIG = {
         'danger': '#dc3545',
         'success': '#28a745'
     },
-    'show_kde': True,  # Show kernel density estimate on histograms
+    'show_kde': True,
     'show_confidence_intervals': True,
     'animation_duration': 500
 }
 
-# Period multipliers for time conversion
 PERIOD_MULTIPLIERS = {
     'Day': 1/252,
     'Week': 1/52,
@@ -184,7 +170,6 @@ PERIOD_MULTIPLIERS = {
     'Year': 1
 }
 
-# Distribution types and their parameters
 DISTRIBUTION_CONFIG = {
     'normal': {
         'name': 'Normal (Gaussian)',
@@ -199,16 +184,14 @@ DISTRIBUTION_CONFIG = {
         'name': 'Skewed Student-t',
         'parameters': ['tdf', 'skew'],
         'default_tdf': 5.0,
-        'default_skew': 0.2
+        'default_skew': 0.0  # Changed from 0.2
     }
 }
 
-# Risk-free rate assumptions for Sharpe calculation
-RISK_FREE_RATE = 2.0  # 2% annual
+RISK_FREE_RATE = 2.0  # 2% annual, scaled by horizon in calculations
 
-# Monte Carlo simulation defaults
 MC_DEFAULTS = {
-    'steps_per_year': 252,  # Trading days
-    'min_vol': 0.0001,  # Minimum volatility to prevent numerical issues
-    'max_vol': 3.0,  # Maximum annualized volatility (300%)
+    'steps_per_year': 252,
+    'min_vol': 0.0001,
+    'max_vol': 0.3  # Reduced from 3.0
 }
