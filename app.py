@@ -53,11 +53,18 @@ def display_validation_errors(errors: list):
 def annualize_returns(returns: list, period_type: str) -> list:
     """Convert returns from their period type to annual returns"""
     multiplier = PERIOD_MULTIPLIERS[period_type]
-    # Annualization factor (how many periods in a year)
     periods_per_year = 1 / multiplier
     
-    # Convert to annualized returns
-    annualized = [(((1 + r/100) ** periods_per_year) - 1) * 100 for r in returns]
+    annualized = []
+    for r in returns:
+        # Handle percentage vs. decimal (assume > 1.0 is percentage)
+        r_decimal = r / 100.0 if abs(r) > 1.0 else r
+        # Validate reasonable range to prevent overflow
+        if abs(r_decimal) > 10:  # Cap at 1000% per period
+            logger.warning(f"Extreme return {r}% clipped for annualization")
+            r_decimal = min(max(r_decimal, -10), 10)
+        # Compound annualization
+        annualized.append((((1 + r_decimal) ** periods_per_year) - 1) * 100)
     return annualized
 
 
