@@ -113,54 +113,52 @@ class ProfessionalMCModel:
         # Calculate statistics
         return calculate_stats(returns)
 
-    def _run_sequential(self, mu, sigma, horizon, mean_reversion, dist_type, tdf,
-                       enable_garch, inputs, iterations, base_seed) -> List[float]:
-        """Run simulations sequentially"""
-        logger.info(f"Running sequential simulation with {iterations} iterations")
-        
-        returns = []
-        garch_omega = inputs.get('garchOmega', 0.0001) if enable_garch else 0
-        garch_alpha = inputs.get('garchAlpha', 0.08) if enable_garch else 0
-        garch_beta = inputs.get('garchBeta', 0.90) if enable_garch else 0
-        skew = inputs.get('skew', DISTRIBUTION_CONFIG[dist_type].get('default_skew', 0.2) if dist_type == 'skewt' else 0.0)
-        
-        progress_bar = st.progress(0)  # Add progress bar for sequential mode
-        for i in range(iterations):
-            args = (
-                mu, sigma, horizon, mean_reversion, dist_type, tdf,
-                enable_garch, garch_omega, garch_alpha, garch_beta, skew,
-                (base_seed + i) if base_seed is not None else None
-            )
-            returns.append(_simulate_path(args))
-            progress_bar.progress((i + 1) / iterations)
-        
-        return returns
+def _run_sequential(self, mu, sigma, horizon, mean_reversion, dist_type, tdf,
+                    enable_garch, inputs, iterations, base_seed) -> List[float]:
+    """Run simulations sequentially"""
+    logger.info(f"Running sequential simulation with {iterations} iterations")
+    
+    returns = []
+    garch_omega = inputs.get('garchOmega', 0.0001) if enable_garch else 0
+    garch_alpha = inputs.get('garchAlpha', 0.08) if enable_garch else 0
+    garch_beta = inputs.get('garchBeta', 0.90) if enable_garch else 0
+    skew = inputs.get('skew', DISTRIBUTION_CONFIG[dist_type].get('default_skew', 0.2) if dist_type == 'skewt' else 0.0)
+    
+    progress_bar = st.progress(0)
+    for i in range(iterations):
+        args = (
+            mu, sigma, horizon, mean_reversion, dist_type, tdf,
+            enable_garch, garch_omega, garch_alpha, garch_beta, skew,
+            (base_seed + i) if base_seed is not None else None
+        )
+        returns.append(_simulate_path(args))
+        progress_bar.progress((i + 1) / iterations)
+    
+    return returns
 
-    def _run_parallel(self, mu, sigma, horizon, mean_reversion, dist_type, tdf,
-                     enable_garch, inputs, iterations, base_seed) -> List[float]:
-        """Run simulations in parallel using multiprocessing"""
-        logger.info(f"Running parallel simulation with {self.n_processes} processes")
-        
-        garch_omega = inputs.get('garchOmega', 0.0001) if enable_garch else 0
-        garch_alpha = inputs.get('garchAlpha', 0.08) if enable_garch else 0
-        garch_beta = inputs.get('garchBeta', 0.90) if enable_garch else 0
-        skew = inputs.get('skew', DISTRIBUTION_CONFIG[dist_type].get('default_skew', 0.2) if dist_type == 'skewt' else 0.0)
-        
-        # Create argument list for each simulation
-        args_list = [
-            (
-                mu, sigma, horizon, mean_reversion, dist_type, tdf,
-                enable_garch, garch_omega, garch_alpha, garch_beta, skew,
-                (base_seed + i) if base_seed is not None else None
-            )
-            for i in range(iterations)
-        ]
-        
-        # Run in parallel
-        with Pool(processes=self.n_processes) as pool:
-            returns = pool.map(_simulate_path, args_list)
-        
-        return returns
+def _run_parallel(self, mu, sigma, horizon, mean_reversion, dist_type, tdf,
+                  enable_garch, inputs, iterations, base_seed) -> List[float]:
+    """Run simulations in parallel using multiprocessing"""
+    logger.info(f"Running parallel simulation with {self.n_processes} processes")
+    
+    garch_omega = inputs.get('garchOmega', 0.0001) if enable_garch else 0
+    garch_alpha = inputs.get('garchAlpha', 0.08) if enable_garch else 0
+    garch_beta = inputs.get('garchBeta', 0.90) if enable_garch else 0
+    skew = inputs.get('skew', DISTRIBUTION_CONFIG[dist_type].get('default_skew', 0.2) if dist_type == 'skewt' else 0.0)
+    
+    args_list = [
+        (
+            mu, sigma, horizon, mean_reversion, dist_type, tdf,
+            enable_garch, garch_omega, garch_alpha, garch_beta, skew,
+            (base_seed + i) if base_seed is not None else None
+        )
+        for i in range(iterations)
+    ]
+    
+    with Pool(processes=self.n_processes) as pool:
+        returns = pool.map(_simulate_path, args_list)
+    
+    return returns
 
     def backtest(self, inputs: Dict) -> Dict:
         """
