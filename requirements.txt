@@ -1,5 +1,18 @@
+# Core dependencies
 streamlit
 pandas
 numpy
 plotly
 scipy
+
+# Optional: For YAML configuration support
+# pyyaml
+
+# Optional: For testing
+# pytest
+# pytest-cov
+
+# Optional: For API endpoint
+# fastapi
+# uvicorn
+# pydantic
