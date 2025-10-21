@@ -77,6 +77,8 @@ def main():
         st.session_state.sensitivity_results = None
     if 'last_run_time' not in st.session_state:
         st.session_state.last_run_time = None
+    if 'historical_macro_data' not in st.session_state:
+        st.session_state.historical_macro_data = []
 
     # Sidebar for mode selection and settings
     with st.sidebar:
@@ -205,80 +207,316 @@ def main():
                 help="Speed of reversion to mean (0=none, 1=instant)"
             )
 
+        # Parse historical returns early to know how many periods we have
+        try:
+            historical_data = parse_returns(hist_returns)
+            num_historical_periods = len(historical_data)
+        except:
+            historical_data = []
+            num_historical_periods = 0
+
         st.subheader("2️⃣ Macro Environment")
         
-        col_real, col_exp_real, col_infl = st.columns(3)
-        with col_real:
-            real_rate = st.number_input(
-                "Real Rate (%)",
-                step=0.01,
-                value=2.1,
-                key="real_rate",
-                help="Current real interest rate"
-            )
-        with col_exp_real:
-            exp_real_rate = st.number_input(
-                "Exp. Real Rate (%)",
-                step=0.01,
-                value=1.8,
-                key="exp_real_rate",
-                help="Expected future real rate"
-            )
-        with col_infl:
-            infl_exp = st.number_input(
-                "Inflation Exp. (%)",
-                step=0.01,
-                value=2.3,
-                key="infl_exp",
-                help="Expected inflation rate"
-            )
+        # Toggle between single current macro or historical macro data
+        macro_input_mode = st.radio(
+            "Macro Data Input Mode",
+            ["Current Only (for forecasting)", "Historical (for each period)"],
+            help="Current: Single set of macro conditions for forecast | Historical: Macro conditions for each historical period"
+        )
+        
+        if macro_input_mode == "Current Only (for forecasting)":
+            # Single set of macro inputs (original behavior)
+            st.caption("📍 Current macro conditions for forecasting")
+            
+            col_real, col_exp_real, col_infl = st.columns(3)
+            with col_real:
+                real_rate = st.number_input(
+                    "Real Rate (%)",
+                    step=0.01,
+                    value=2.1,
+                    key="real_rate",
+                    help="Current real interest rate"
+                )
+            with col_exp_real:
+                exp_real_rate = st.number_input(
+                    "Exp. Real Rate (%)",
+                    step=0.01,
+                    value=1.8,
+                    key="exp_real_rate",
+                    help="Expected future real rate"
+                )
+            with col_infl:
+                infl_exp = st.number_input(
+                    "Inflation Exp. (%)",
+                    step=0.01,
+                    value=2.3,
+                    key="infl_exp",
+                    help="Expected inflation rate"
+                )
 
-        col_vix, col_dxy, col_credit = st.columns(3)
-        with col_vix:
-            vix = st.number_input(
-                "VIX",
-                step=0.1,
-                min_value=5.0,
-                max_value=100.0,
-                value=15.5,
-                key="vix",
-                help="Volatility index (market fear gauge)"
-            )
-        with col_dxy:
-            dxy = st.number_input(
-                "DXY",
-                step=0.1,
-                min_value=70.0,
-                max_value=150.0,
-                value=103.2,
-                key="dxy",
-                help="Dollar index"
-            )
-        with col_credit:
-            credit_spread = st.number_input(
-                "Credit Spread (bps)",
-                step=1.0,
-                min_value=0.0,
-                max_value=500.0,
-                value=85.0,
-                key="credit_spread",
-                help="Credit spread in basis points"
-            )
+            col_vix, col_dxy, col_credit = st.columns(3)
+            with col_vix:
+                vix = st.number_input(
+                    "VIX",
+                    step=0.1,
+                    min_value=5.0,
+                    max_value=100.0,
+                    value=15.5,
+                    key="vix",
+                    help="Volatility index (market fear gauge)"
+                )
+            with col_dxy:
+                dxy = st.number_input(
+                    "DXY",
+                    step=0.1,
+                    min_value=70.0,
+                    max_value=150.0,
+                    value=103.2,
+                    key="dxy",
+                    help="Dollar index"
+                )
+            with col_credit:
+                credit_spread = st.number_input(
+                    "Credit Spread (bps)",
+                    step=1.0,
+                    min_value=0.0,
+                    max_value=500.0,
+                    value=85.0,
+                    key="credit_spread",
+                    help="Credit spread in basis points"
+                )
 
-        col_term, col_horizon = st.columns(2)
-        with col_term:
-            term_spread = st.number_input(
-                "Term Spread (bps)",
-                step=1.0,
-                value=45.0,
-                key="term_spread",
-                help="Yield curve slope (10Y - 2Y)"
-            )
-        with col_horizon:
-            # Calculate horizon in years
+            col_term, _ = st.columns(2)
+            with col_term:
+                term_spread = st.number_input(
+                    "Term Spread (bps)",
+                    step=1.0,
+                    value=45.0,
+                    key="term_spread",
+                    help="Yield curve slope (10Y - 2Y)"
+                )
+            
+            # Store as single-item list for consistency
+            historical_macro_list = None
+            
+        else:
+            # Historical macro data for each period
+            if num_historical_periods == 0:
+                st.warning("⚠️ Please enter historical returns first to determine number of periods")
+                historical_macro_list = []
+            else:
+                st.caption(f"📊 Enter macro conditions for each of {num_historical_periods} {hist_period_type.lower()}(s)")
+                
+                # Option to upload CSV or enter manually
+                input_method = st.radio(
+                    "Input Method",
+                    ["Manual Entry", "Upload CSV"],
+                    horizontal=True
+                )
+                
+                if input_method == "Upload CSV":
+                    st.info(
+                        "📋 CSV should have columns: period, real_rate, exp_real_rate, infl_exp, vix, dxy, credit_spread, term_spread"
+                    )
+                    uploaded_file = st.file_uploader("Upload Macro Data CSV", type=['csv'])
+                    
+                    if uploaded_file is not None:
+                        try:
+                            macro_df = pd.read_csv(uploaded_file)
+                            required_cols = ['real_rate', 'exp_real_rate', 'infl_exp', 'vix', 'dxy', 'credit_spread', 'term_spread']
+                            
+                            if all(col in macro_df.columns for col in required_cols):
+                                historical_macro_list = []
+                                for idx, row in macro_df.iterrows():
+                                    if idx >= num_historical_periods:
+                                        break
+                                    historical_macro_list.append({
+                                        'realRate': float(row['real_rate']),
+                                        'expRealRate': float(row['exp_real_rate']),
+                                        'inflExp': float(row['infl_exp']),
+                                        'vix': float(row['vix']),
+                                        'dxy': float(row['dxy']),
+                                        'creditSpread': float(row['credit_spread']),
+                                        'termSpread': float(row['term_spread'])
+                                    })
+                                st.success(f"✅ Loaded macro data for {len(historical_macro_list)} periods")
+                                st.session_state.historical_macro_data = historical_macro_list
+                            else:
+                                st.error(f"❌ CSV missing required columns: {required_cols}")
+                                historical_macro_list = []
+                        except Exception as e:
+                            st.error(f"❌ Error reading CSV: {str(e)}")
+                            historical_macro_list = []
+                    else:
+                        historical_macro_list = st.session_state.historical_macro_data if st.session_state.historical_macro_data else []
+                
+                else:
+                    # Manual entry with expander for each period
+                    st.info("💡 Tip: Use 'Fill All Periods' button to quickly set the same values for all periods")
+                    
+                    # Quick fill option
+                    with st.expander("⚡ Quick Fill All Periods", expanded=False):
+                        col_qf1, col_qf2, col_qf3 = st.columns(3)
+                        with col_qf1:
+                            qf_real = st.number_input("Real Rate (%)", value=2.0, key="qf_real")
+                            qf_exp_real = st.number_input("Exp. Real Rate (%)", value=1.8, key="qf_exp_real")
+                        with col_qf2:
+                            qf_infl = st.number_input("Inflation Exp. (%)", value=2.3, key="qf_infl")
+                            qf_vix = st.number_input("VIX", value=15.5, key="qf_vix")
+                        with col_qf3:
+                            qf_dxy = st.number_input("DXY", value=103.0, key="qf_dxy")
+                            qf_credit = st.number_input("Credit Spread (bps)", value=85.0, key="qf_credit")
+                        
+                        qf_term = st.number_input("Term Spread (bps)", value=45.0, key="qf_term")
+                        
+                        if st.button("📝 Fill All Periods with These Values"):
+                            st.session_state.historical_macro_data = [
+                                {
+                                    'realRate': qf_real,
+                                    'expRealRate': qf_exp_real,
+                                    'inflExp': qf_infl,
+                                    'vix': qf_vix,
+                                    'dxy': qf_dxy,
+                                    'creditSpread': qf_credit,
+                                    'termSpread': qf_term
+                                }
+                                for _ in range(num_historical_periods)
+                            ]
+                            st.success(f"✅ Filled {num_historical_periods} periods!")
+                            st.rerun()
+                    
+                    # Initialize if empty
+                    if len(st.session_state.historical_macro_data) != num_historical_periods:
+                        st.session_state.historical_macro_data = [
+                            {
+                                'realRate': 2.0,
+                                'expRealRate': 1.8,
+                                'inflExp': 2.3,
+                                'vix': 15.5,
+                                'dxy': 103.0,
+                                'creditSpread': 85.0,
+                                'termSpread': 45.0
+                            }
+                            for _ in range(num_historical_periods)
+                        ]
+                    
+                    # Display in a scrollable container with tabs for better UX
+                    st.markdown("---")
+                    
+                    # Show as table for easier viewing
+                    if st.checkbox("📊 Show as Editable Table", value=True):
+                        macro_df = pd.DataFrame(st.session_state.historical_macro_data)
+                        macro_df.insert(0, 'Period', range(1, len(macro_df) + 1))
+                        
+                        edited_df = st.data_editor(
+                            macro_df,
+                            use_container_width=True,
+                            num_rows="fixed",
+                            height=400,
+                            column_config={
+                                "Period": st.column_config.NumberColumn("Period", disabled=True),
+                                "realRate": st.column_config.NumberColumn("Real Rate (%)", format="%.2f"),
+                                "expRealRate": st.column_config.NumberColumn("Exp. Real Rate (%)", format="%.2f"),
+                                "inflExp": st.column_config.NumberColumn("Inflation Exp. (%)", format="%.2f"),
+                                "vix": st.column_config.NumberColumn("VIX", format="%.1f"),
+                                "dxy": st.column_config.NumberColumn("DXY", format="%.1f"),
+                                "creditSpread": st.column_config.NumberColumn("Credit Spread (bps)", format="%.0f"),
+                                "termSpread": st.column_config.NumberColumn("Term Spread (bps)", format="%.0f")
+                            }
+                        )
+                        
+                        # Update session state from edited table
+                        st.session_state.historical_macro_data = edited_df.drop('Period', axis=1).to_dict('records')
+                    
+                    else:
+                        # Individual period inputs (old method)
+                        for period_idx in range(num_historical_periods):
+                            with st.expander(f"Period {period_idx + 1} - Return: {historical_data[period_idx]:.2f}%", expanded=False):
+                                col1, col2, col3 = st.columns(3)
+                                
+                                with col1:
+                                    st.session_state.historical_macro_data[period_idx]['realRate'] = st.number_input(
+                                        "Real Rate (%)",
+                                        value=st.session_state.historical_macro_data[period_idx]['realRate'],
+                                        key=f"hist_real_{period_idx}",
+                                        step=0.1
+                                    )
+                                    st.session_state.historical_macro_data[period_idx]['expRealRate'] = st.number_input(
+                                        "Exp. Real Rate (%)",
+                                        value=st.session_state.historical_macro_data[period_idx]['expRealRate'],
+                                        key=f"hist_exp_real_{period_idx}",
+                                        step=0.1
+                                    )
+                                
+                                with col2:
+                                    st.session_state.historical_macro_data[period_idx]['inflExp'] = st.number_input(
+                                        "Inflation Exp. (%)",
+                                        value=st.session_state.historical_macro_data[period_idx]['inflExp'],
+                                        key=f"hist_infl_{period_idx}",
+                                        step=0.1
+                                    )
+                                    st.session_state.historical_macro_data[period_idx]['vix'] = st.number_input(
+                                        "VIX",
+                                        value=st.session_state.historical_macro_data[period_idx]['vix'],
+                                        key=f"hist_vix_{period_idx}",
+                                        min_value=5.0,
+                                        max_value=100.0,
+                                        step=0.5
+                                    )
+                                
+                                with col3:
+                                    st.session_state.historical_macro_data[period_idx]['dxy'] = st.number_input(
+                                        "DXY",
+                                        value=st.session_state.historical_macro_data[period_idx]['dxy'],
+                                        key=f"hist_dxy_{period_idx}",
+                                        min_value=70.0,
+                                        max_value=150.0,
+                                        step=0.5
+                                    )
+                                    st.session_state.historical_macro_data[period_idx]['creditSpread'] = st.number_input(
+                                        "Credit Spread (bps)",
+                                        value=st.session_state.historical_macro_data[period_idx]['creditSpread'],
+                                        key=f"hist_credit_{period_idx}",
+                                        min_value=0.0,
+                                        max_value=500.0,
+                                        step=5.0
+                                    )
+                                
+                                st.session_state.historical_macro_data[period_idx]['termSpread'] = st.number_input(
+                                    "Term Spread (bps)",
+                                    value=st.session_state.historical_macro_data[period_idx]['termSpread'],
+                                    key=f"hist_term_{period_idx}",
+                                    step=5.0
+                                )
+                    
+                    historical_macro_list = st.session_state.historical_macro_data
+            
+            # Use first period's values as "current" for forecast
+            if historical_macro_list and len(historical_macro_list) > 0:
+                real_rate = historical_macro_list[-1]['realRate']  # Use most recent
+                exp_real_rate = historical_macro_list[-1]['expRealRate']
+                infl_exp = historical_macro_list[-1]['inflExp']
+                vix = historical_macro_list[-1]['vix']
+                dxy = historical_macro_list[-1]['dxy']
+                credit_spread = historical_macro_list[-1]['creditSpread']
+                term_spread = historical_macro_list[-1]['termSpread']
+            else:
+                # Defaults
+                real_rate = 2.1
+                exp_real_rate = 1.8
+                infl_exp = 2.3
+                vix = 15.5
+                dxy = 103.2
+                credit_spread = 85.0
+                term_spread = 45.0
+
+        # Forecast horizon display
+        st.markdown("---")
+        col_horizon_display = st.columns(1)[0]
+        with col_horizon_display:
             horizon_years = period_count * PERIOD_MULTIPLIERS[period_unit]
             st.metric(
-                "Forecast Horizon",
+                "📅 Forecast Horizon",
                 f"{horizon_years:.2f} years",
                 delta=f"{period_count} {period_unit.lower()}(s)",
                 help="Calculated from period settings in sidebar"
@@ -428,13 +666,15 @@ def main():
             st.session_state.baseline_mean = random.uniform(0, 15)
             st.session_state.baseline_sigma = random.uniform(5, 25)
             st.session_state.mean_reversion = random.uniform(0, PARAMETER_BOUNDS['mean_reversion'][1])
-            st.session_state.real_rate = random.uniform(-2, 5)
-            st.session_state.exp_real_rate = random.uniform(-2, 5)
-            st.session_state.infl_exp = random.uniform(0, 6)
-            st.session_state.vix = random.uniform(5, 100)
-            st.session_state.dxy = random.uniform(70, 150)
-            st.session_state.credit_spread = random.uniform(0, 500)
-            st.session_state.term_spread = random.uniform(-100, 100)
+            
+            if macro_input_mode == "Current Only (for forecasting)":
+                st.session_state.real_rate = random.uniform(-2, 5)
+                st.session_state.exp_real_rate = random.uniform(-2, 5)
+                st.session_state.infl_exp = random.uniform(0, 6)
+                st.session_state.vix = random.uniform(5, 100)
+                st.session_state.dxy = random.uniform(70, 150)
+                st.session_state.credit_spread = random.uniform(0, 500)
+                st.session_state.term_spread = random.uniform(-100, 100)
             
             for param in ASSET_PRESETS[asset_type]['betas']:
                 min_val, max_val = PARAMETER_BOUNDS[f"beta_{param}"]
@@ -521,7 +761,8 @@ def main():
         'garchAlpha': garch_alpha,
         'garchBeta': garch_beta,
         'betas': betas,
-        'historical_data': historical_data_for_model
+        'historical_data': historical_data_for_model,
+        'historical_macro_data': historical_macro_list  # New: list of macro conditions per period
     }
 
     # Validate inputs
@@ -709,7 +950,7 @@ def main():
             
             # Add metadata
             metadata = pd.DataFrame({
-                'Parameter': ['Mode', 'Date', 'Iterations', 'Asset Type', 'Horizon', 'Historical Period Type', 'Historical Data Points'],
+                'Parameter': ['Mode', 'Date', 'Iterations', 'Asset Type', 'Horizon', 'Historical Period Type', 'Historical Data Points', 'Macro Input Mode'],
                 'Value': [
                     mode,
                     datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
@@ -717,7 +958,8 @@ def main():
                     ASSET_PRESETS[asset_type]['name'],
                     f"{horizon_years:.2f} years ({period_count} {period_unit})",
                     hist_period_type,
-                    len(historical_data)
+                    len(historical_data),
+                    macro_input_mode
                 ]
             })
             
